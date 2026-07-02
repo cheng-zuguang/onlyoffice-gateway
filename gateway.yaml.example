@@ -1,0 +1,70 @@
+# =============================================================================
+# ONLYOFFICE Gateway Configuration
+# =============================================================================
+# 复制此文件为 gateway.yaml 并根据环境调整。
+
+# Gateway 监听地址
+# - 本机使用: "127.0.0.1:18080"
+# - Docker 内或需外部访问: "0.0.0.0:18080"
+listen_addr: "127.0.0.1:18080"
+
+# ONLYOFFICE Document Server 地址
+# - 云服务: "https://doc.your-company.com"
+# - 本地 Docker: "http://localhost:8080"
+document_server_url: "https://your-onlyoffice-documentserver.com"
+
+# JWT 签名密钥 —— 必须与 Document Server 的 jwt.secret 一致
+jwt_secret: "change-me-to-match-document-server-jwt-secret"
+
+# 文档暂存目录（Gateway 进程需有读写权限）
+storage_dir: "./data/storage"
+
+# 文档 TTL（小时），过期自动清理。编辑中自动续期。
+ttl_hours: 8
+
+# Webhook 失败最大重试次数（指数退避: 1s, 2s, 4s ...）
+webhook_max_retries: 3
+
+# =============================================================================
+# 业务服务注册
+# =============================================================================
+# 每个需要接入的业务服务一个条目。
+# 
+# 服务接入步骤:
+#   1. 生成 RSA 密钥对（2048 位）
+#   2. 将公钥提供给 Gateway 管理员，写入下方 public_key
+#   3. 服务用自己的私钥签 JWT，调用 Gateway API
+#
+# 生成密钥:
+#   openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
+#   openssl rsa -pubout -in private.pem -out public.pem
+
+services:
+  - id: "your-service-name"
+    # 业务服务的 RSA 公钥（PEM 格式，用于验证服务 JWT）
+    public_key: |
+      -----BEGIN PUBLIC KEY-----
+      YOUR_RSA_PUBLIC_KEY_HERE
+      -----END PUBLIC KEY-----
+    # 允许的回调域名白名单
+    # 服务上传文档时 webhook_url 的域名必须在此列表中
+    allowed_webhook_domains:
+      - "your-app.example.com"
+      - "your-app-staging.example.com"
+
+  # 多个服务示例:
+  # - id: "crm-service"
+  #   public_key: |
+  #     -----BEGIN PUBLIC KEY-----
+  #     ...
+  #     -----END PUBLIC KEY-----
+  #   allowed_webhook_domains:
+  #     - "crm.example.com"
+  #
+  # - id: "doc-platform"
+  #   public_key: |
+  #     -----BEGIN PUBLIC KEY-----
+  #     ...
+  #     -----END PUBLIC KEY-----
+  #   allowed_webhook_domains:
+  #     - "docs.example.com"
