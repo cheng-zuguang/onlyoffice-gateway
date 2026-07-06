@@ -1,0 +1,92 @@
+version: "3.8"
+
+services:
+  # =========================================================================
+  # ONLYOFFICE Document Server
+  # =========================================================================
+  document-server:
+    image: onlyoffice/documentserver:latest
+    container_name: oo-document-server
+    restart: unless-stopped
+
+    environment:
+      # ── JWT ──────────────────────────────────────────────────
+      JWT_ENABLED: ${JWT_ENABLED:-true}
+      JWT_SECRET:  ${JWT_SECRET:-}
+      JWT_HEADER:  ${JWT_HEADER:-Authorization}
+      JWT_IN_BODY: ${JWT_IN_BODY:-false}
+
+      # ── 网络 ─────────────────────────────────────────────────
+      ALLOW_PRIVATE_IP_ADDRESS: ${ALLOW_PRIVATE_IP_ADDRESS:-true}
+      ALLOW_META_IP_ADDRESS:    ${ALLOW_META_IP_ADDRESS:-true}
+      USE_UNAUTHORIZED_STORAGE: ${USE_UNAUTHORIZED_STORAGE:-true}
+
+      # ── 优化 ─────────────────────────────────────────────────
+      EXAMPLE_ENABLED: ${EXAMPLE_ENABLED:-true}
+      METRICS_ENABLED: ${METRICS_ENABLED:-false}
+      DS_LOG_LEVEL:    ${DS_LOG_LEVEL:-warn}
+
+      # ── 字体 / WOPI ──────────────────────────────────────────
+      GENERATE_FONTS: ${GENERATE_FONTS:-true}
+      WOPI_ENABLED:   ${WOPI_ENABLED:-false}
+
+    ports:
+      - "${DS_PORT:-8080}:80"
+
+    volumes:
+      - ds-data:/var/www/onlyoffice/Data
+      - ds-log:/var/log/onlyoffice
+      - ds-cache:/var/lib/onlyoffice
+      - ds-fonts:/usr/share/fonts/truetype/custom
+
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:80/healthcheck"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 60s
+
+    stop_grace_period: 60s
+
+  # =========================================================================
+  # ONLYOFFICE Gateway
+  # =========================================================================
+  gateway:
+    build:
+      context: .
+      args:
+        VERSION: v0.1.0
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+        COMMIT: ${COMMIT:-unknown}
+    container_name: oo-gateway
+    restart: unless-stopped
+
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-}
+
+    ports:
+      - "${GATEWAY_PORT:-18080}:18080"
+
+    volumes:
+      - ./gateway.yaml:/app/gateway.yaml:ro
+      - gateway-data:/app/data
+
+    depends_on:
+      document-server:
+        condition: service_healthy
+
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:18080/api/v1/health"]
+      interval: 15s
+      timeout:  5s
+      retries:  3
+      start_period: 5s
+
+    stop_grace_period: 10s
+
+volumes:
+  ds-data:
+  ds-log:
+  ds-cache:
+  ds-fonts:
+  gateway-data:

@@ -1066,6 +1066,51 @@ func TestEditRendersBrandingFromUpload(t *testing.T) {
 		t.Fatalf("expected language zh-CN in editor HTML: %s", truncate(htmlStr, 400))
 	}
 }
+
+// S29: Gateway can report Document Server connectivity status.
+func TestDocumentServerHealthCheck(t *testing.T) {
+	fakeDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fakeDS.Close()
+
+	_, pubPEM := generateRSAKeyPair(t)
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: fakeDS.URL,
+		JWTSecret:         "test-secret",
+		StorageDir:        filepath.Join(tmpDir, "storage"),
+		TTLHours:          8,
+		WebhookMaxRetries: 3,
+		Services: []config.ServiceConfig{
+			{ID: "test", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"localhost"}},
+		},
+	}
+	loaded, _ := config.FromLiteral(cfg)
+	handler := gateway.NewHandler(loaded)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	req, _ := http.NewRequest("GET", server.URL+"/api/v1/health/ds", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	ok, _ := result["document_server_ok"].(bool)
+	if !ok {
+		t.Fatalf("expected document_server_ok=true, got: %v", result)
+	}
+}
 func contains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {

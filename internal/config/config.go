@@ -67,6 +67,10 @@ func Load(path string) (*Config, error) {
 		}
 		cfg.Services[i].parsedPublicKey = rsaPub
 	}
+	// Override from environment variables
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		cfg.JWTSecret = s
+	}
 	cfg.StorageDir, err = filepath.Abs(cfg.StorageDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage dir: %w", err)
@@ -137,6 +141,10 @@ func FromLiteral(cfg *Config) (*Config, error) {
 		cfg.Services[i].SetPublicKey(rsaPub)
 	}
 	var err error
+	// Override from environment variables
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		cfg.JWTSecret = s
+	}
 	cfg.StorageDir, err = filepath.Abs(cfg.StorageDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage dir: %w", err)

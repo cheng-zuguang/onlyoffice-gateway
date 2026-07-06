@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"io"
+	"fmt"
 	"net/http"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
@@ -42,7 +43,24 @@ func NewHandler(cfg *config.Config) http.Handler {
 		io.Copy(w, reader)
 	})
 
-	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+	
+	mux.HandleFunc("GET /api/v1/health/ds", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		dsURL := cfg.DocumentServerURL + "/healthcheck"
+		resp, err := http.Get(dsURL)
+		ok := err == nil && resp != nil && resp.StatusCode == http.StatusOK
+		if resp != nil {
+			resp.Body.Close()
+		}
+		status := http.StatusOK
+		if !ok {
+			status = http.StatusServiceUnavailable
+		}
+		w.WriteHeader(status)
+		fmt.Fprintf(w, `{"document_server_ok":%t,"document_server_url":"%s"}`, ok, cfg.DocumentServerURL)
+	})
+
+mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
