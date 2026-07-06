@@ -17,7 +17,14 @@ ttl_hours: 8
 webhook_max_retries: 3
 
 services:
-  - id: "your-service-name"
+  # ── 方式一：从文件读取（推荐，零 YAML 缩进问题） ──
+  # - id: "your-service-name"
+  #   public_key_file: /etc/onlyoffice/keys/your-service-public.pem
+  #   allowed_webhook_domains:
+  #     - "your-app.example.com"
+
+  # ── 方式二：内联 PEM（注意：所有行必须比 public_key 多缩进 2 格） ──
+  - id: "example-service"
     public_key: |
       -----BEGIN PUBLIC KEY-----
       YOUR_RSA_PUBLIC_KEY_HERE
