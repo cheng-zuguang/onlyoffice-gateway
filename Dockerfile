@@ -16,4 +16,4 @@ WORKDIR /app
 COPY --from=builder /app/gateway .
 VOLUME /app/data
 EXPOSE 18080
-ENTRYPOINT ["./gateway", "-config", "/app/gateway.yaml"]
+ENTRYPOINT ["./gateway"]

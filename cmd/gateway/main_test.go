@@ -1,10 +1,7 @@
 package main_test
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,36 +15,34 @@ func TestMainStartsAndRespondsToHealth(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "gateway.yaml")
 	storageDir := filepath.Join(tmpDir, "storage")
+	servicesPath := filepath.Join(tmpDir, "services.json")
 	binPath := filepath.Join(tmpDir, "gateway")
 
-	// Generate valid RSA key
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	pubBytes, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		t.Fatalf("marshal pub: %v", err)
-	}
-	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes})
-
-	// Write config
+	// Write config without services
 	cfg := fmt.Sprintf(`listen_addr: "127.0.0.1:18999"
 document_server_url: "https://doc.example.com"
 jwt_secret: "test-secret"
 storage_dir: "%s"
 ttl_hours: 8
 webhook_max_retries: 3
-services:
-  - id: "test-service"
-    public_key: |
-%s
-    allowed_webhook_domains:
-      - "test.example.com"
-`, storageDir, indentLines(string(pubPEM), 6))
+`, storageDir)
 	os.WriteFile(configPath, []byte(cfg), 0644)
 
-	// Build binary from module root
+	// Pre-seed the service store with a test service
+	services := []map[string]interface{}{
+		{
+			"id": "test-service",
+			"public_key": `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0TestKeyForIntegration
+TestOnlyNotARealKeyButWeJustCheckHealthEndpointWhichDoesNotNeedServices
+-----END PUBLIC KEY-----`,
+			"allowed_webhook_domains": []string{"test.example.com"},
+		},
+	}
+	servicesData, _ := json.MarshalIndent(services, "", "  ")
+	os.WriteFile(servicesPath, servicesData, 0644)
+
+	// Build binary
 	modRoot := findModuleRoot(t)
 	buildCmd := exec.Command("go", "build", "-o", binPath, "./cmd/gateway/")
 	buildCmd.Dir = modRoot
@@ -55,9 +50,23 @@ services:
 		t.Fatalf("build failed: %v\n%s", err, out)
 	}
 
-	// Start the gateway
+	// Start the gateway. Explicitly set all env vars so the test is immune
+	// to whatever .env file may exist in the project root.
 	cmd := exec.Command(binPath, "-config", configPath)
-	cmd.Dir = modRoot
+	cmd.Dir = tmpDir // run from temp dir so it doesn't find project .env
+	cmd.Env = append(os.Environ(),
+		"LISTEN_ADDR=127.0.0.1:18999",
+		"DOCUMENT_SERVER_URL=https://doc.example.com",
+		"JWT_SECRET=test-secret",
+		"SERVICE_STORE_PATH="+servicesPath,
+		"ADMIN_USERNAME=admin",
+		"ADMIN_PASSWORD=admin123",
+		"STORAGE_DIR="+storageDir,
+		"TTL_HOURS=8",
+		"WEBHOOK_MAX_RETRIES=3",
+		"HOME="+os.Getenv("HOME"),
+		"PATH="+os.Getenv("PATH"),
+	)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -97,37 +106,4 @@ func findModuleRoot(t *testing.T) string {
 		}
 		dir = parent
 	}
-}
-
-func indentLines(s string, spaces int) string {
-	prefix := ""
-	for range spaces {
-		prefix += " "
-	}
-	result := ""
-	lines := splitLines(s)
-	for i, line := range lines {
-		if i > 0 {
-			result += "\n"
-		}
-		if line != "" {
-			result += prefix + line
-		}
-	}
-	return result
-}
-
-func splitLines(s string) []string {
-	var lines []string
-	current := ""
-	for _, c := range s {
-		if c == '\n' {
-			lines = append(lines, current)
-			current = ""
-		} else {
-			current += string(c)
-		}
-	}
-	lines = append(lines, current)
-	return lines
 }

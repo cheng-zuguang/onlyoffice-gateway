@@ -12,12 +12,13 @@ import (
 
 type EditorHandler struct {
 	cfg       *config.Config
+	resolver  gwjwt.ServiceResolver
 	store     storage.Store
 	serverURL string
 }
 
-func NewEditorHandler(cfg *config.Config, store storage.Store, serverURL string) *EditorHandler {
-	return &EditorHandler{cfg: cfg, store: store, serverURL: serverURL}
+func NewEditorHandler(cfg *config.Config, resolver gwjwt.ServiceResolver, store storage.Store, serverURL string) *EditorHandler {
+	return &EditorHandler{cfg: cfg, resolver: resolver, store: store, serverURL: serverURL}
 }
 
 func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -28,7 +29,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claims, err := gwjwt.VerifyServiceJWT(h.cfg, tokenStr)
+	claims, err := gwjwt.VerifyServiceJWT(h.resolver, tokenStr)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or expired token"})
 		return

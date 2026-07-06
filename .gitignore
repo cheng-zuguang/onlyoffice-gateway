@@ -36,3 +36,12 @@ pnpm-debug.log*
 Thumbs.db
 
 .local
+# Admin UI
+admin-ui/dist/
+admin-ui/node_modules/
+
+# Environment
+.env
+
+# local
+data/

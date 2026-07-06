@@ -4,7 +4,6 @@
 
 [![Go](https://img.shields.io/badge/go-1.22+-00ADD8?logo=go)](https://go.dev)
 [![version](https://img.shields.io/badge/version-v0.1.0-blue)](VERSION)
-[![tests](https://img.shields.io/badge/tests-22%20passing-brightgreen)](.)
 
 ## 解决的问题
 
@@ -55,49 +54,58 @@ ONLYOFFICE Docs API 要求每个接入服务自行处理：
 ### 1. 配置
 
 ```bash
-cp gateway.yaml.example gateway.yaml
+cp .env.example .env
 ```
 
-编辑 `gateway.yaml`：
+编辑 `.env`：
 
-```yaml
-listen_addr: "127.0.0.1:18080"
-document_server_url: "https://your-document-server.com"
-jwt_secret: "与 Document Server 一致的 JWT secret"
-storage_dir: "./data/storage"
-ttl_hours: 8
-webhook_max_retries: 3
+```env
+# Gateway
+LISTEN_ADDR=0.0.0.0:18080
+DOCUMENT_SERVER_URL=http://localhost:18000
+JWT_SECRET=                          # 与 Document Server 一致
+STORAGE_DIR=./data/storage
+TTL_HOURS=8
+WEBHOOK_MAX_RETRIES=3
 
-services:
-  - id: "my-app"
-    public_key: |
-      -----BEGIN PUBLIC KEY-----
-      ...
-      -----END PUBLIC KEY-----
-    allowed_webhook_domains:
-      - "my-app.example.com"
+# Admin Panel
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=admin123              # 生产环境务必修改
+SERVICE_STORE_PATH=./data/services.json
 ```
+
+Gateway 核心配置通过 `.env` 环境变量注入。全部配置通过 `.env` 环境变量注入。
 
 ### 2. 启动
 
 ```bash
-make build && ./bin/gateway -config gateway.yaml
-# Gateway v0.1.0 listening on 127.0.0.1:18080
+# 启动网关
+make run
+
+# 另开终端，启动管理端前端
+make frontend-dev
 ```
 
-### 3. 生成 RSA 密钥对（业务服务）
+### 3. 通过管理端注册业务服务
+
+打开 `http://localhost:5173/admin/login`，登录后：
+
+1. 点击 **Add Service**
+2. 填入 Service ID、RSA 公钥（PEM 格式）、Webhook 域名白名单
+3. 提交后立即生效，无需重启 Gateway
+
+### 4. 生成 RSA 密钥对（业务服务）
 
 ```bash
 openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
 openssl rsa -pubout -in private.pem -out public.pem
 ```
 
-将 `public.pem` 内容提供给 Gateway 管理员，写入 `gateway.yaml`。
+将 `public.pem` 的内容粘贴到管理端 "RSA Public Key" 字段。
 
-### 4. 上传文档
+### 5. 上传文档
 
 ```bash
-# 1. 用私钥签 JWT
 TOKEN=$(node -e "
   const jwt = require('jsonwebtoken');
   const fs = require('fs');
@@ -107,209 +115,184 @@ TOKEN=$(node -e "
     webhook_url: 'https://my-app.example.com/callback',
     file_name: 'report.docx',
     document_type: 'word',
-    branding: { logo_url: 'https://my-app.example.com/logo.png', language: 'zh-CN' }
   }, key, { algorithm: 'RS256', expiresIn: '60s' }));
 ")
 
-# 2. 上传
 curl -X POST http://localhost:18080/api/v1/documents \
   -H "Authorization: Bearer $TOKEN" \
   -F "file=@report.docx"
-# → {"document_id":"doc_20260702abc123","status":"uploaded","expires_at":"2026-07-02T22:00:00Z"}
+# → {"document_id":"doc_xxx","status":"uploaded"}
 ```
 
-### 5. 嵌入编辑器
+### 6. 嵌入编辑器
 
 ```tsx
 import { OnlyOfficeEditor } from "@zenmind/onlyoffice-editor";
 
 <OnlyOfficeEditor
-  documentId="doc_20260702abc123"
+  documentId="doc_xxx"
   gatewayUrl="http://localhost:18080"
-  onReady={() => console.log("编辑器就绪")}
-  onSaved={(event) => fetch(`/api/download?doc=${event.document_id}`)}
-  onError={(err) => console.error(err)}
+  token="<edit JWT>"
+  onReady={() => console.log("就绪")}
+  onSaved={(e) => fetch(`/api/download?doc=${e.document_id}`)}
 />
 ```
 
 ## API
 
-### 对外 API（业务服务调用）
+### 业务 API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/documents` | 上传文档 |
+| `POST` | `/api/v1/documents` | 上传文档（JWT RS256 自签） |
 | `GET` | `/api/v1/documents/{id}` | 下载编辑结果 |
-| `DELETE` | `/api/v1/documents/{id}` | 手动清理文档 |
 | `GET` | `/api/v1/health` | 健康检查 |
-| `GET` | `/edit` | 编辑器 HTML 页面（iframe 使用） |
+| `GET` | `/edit` | 编辑器 HTML 页面（iframe） |
 
-### 内部 API（Document Server 专用）
+### Document Server 内部 API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/download/{docId}` | Document Server 下载原始文件 |
 | `POST` | `/callback` | Document Server 回调 |
 
-### POST /api/v1/documents
+### Admin API（管理端）
 
-上传文档到 Gateway。
+| 方法 | 路径 | 认证 | 说明 |
+|---|---|---|---|
+| `POST` | `/admin/api/login` | 无 | 管理员登录，返回 JWT |
+| `GET` | `/admin/api/services` | Bearer | 列出所有业务服务 |
+| `POST` | `/admin/api/services` | Bearer | 新增业务服务 |
+| `DELETE` | `/admin/api/services/{id}` | Bearer | 删除业务服务 |
+
+Admin API 使用 HMAC-SHA256 JWT 认证（复用 `JWT_SECRET`），24h 过期。
+
+### POST /api/v1/documents
 
 **Headers**:
 - `Authorization: Bearer <JWT>`（RS256，服务私钥自签）
 - `Content-Type: multipart/form-data`
 
-**Body**:
-- `file`：文件二进制
-- `meta`：JSON 字符串（可选，覆盖 JWT 中的元数据）
+**Body**: `file`（文件二进制）
 
 **JWT Claims**:
 
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `service_id` | string | ✅ | 服务标识 |
-| `webhook_url` | string | ✅ | 编辑完成回调地址，域名需在白名单内 |
-| `external_id` | string | | 业务侧文档 ID |
-| `user.id` | string | | 编辑者 ID |
-| `user.name` | string | | 编辑者名称 |
-| `file_name` | string | | 文件名 |
-| `document_type` | string | | `word` / `cell` / `slide` / `pdf` |
-| `branding` | object | | 编辑器品牌定制 |
-| `config_overrides` | object | | 完全定制（高级） |
-| `exp` | number | ✅ | JWT 过期时间（建议 60s） |
-
-**branding 字段**:
-
-| 字段 | 映射到 ONLYOFFICE config |
-|---|---|
-| `logo_url` | `editorConfig.customization.logo.image` |
-| `language` | `editorConfig.lang` |
-| `color_theme` | `editorConfig.customization.colors` |
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `service_id` | ✅ | 服务标识 |
+| `webhook_url` | ✅ | 编辑完成回调地址 |
+| `external_id` | | 业务侧文档 ID |
+| `file_name` | | 文件名 |
+| `document_type` | | `word` / `cell` / `slide` / `pdf` |
+| `branding` | | 编辑器品牌定制（logo、语言、主题色） |
+| `config_overrides` | | ONLYOFFICE config 完全覆盖 |
+| `exp` | ✅ | JWT 过期时间（建议 60s） |
 
 ### 编辑器定制
 
-Gateway 通过**三层 merge** 构建 ONLYOFFICE config：
+三层 merge 构建 ONLYOFFICE config：
 
 ```
 Layer 1: Gateway 默认值（必填字段）
-Layer 2: branding（品牌定制：logo、语言、主题色）
+Layer 2: branding（logo、语言、主题色）
 Layer 3: config_overrides（完全穿透覆盖）
 ```
 
-优先级 Layer 3 > Layer 2 > Layer 1。
-
-### Webhook 通知
+### Webhook
 
 ```
 POST <webhook_url>
 X-Gateway-Event: document.saved
-X-Gateway-Signature: sha256=<HMAC-SHA256(url+body, gateway_jwt_secret)>
+X-Gateway-Signature: sha256=<HMAC(url+body, jwt_secret)>
 
-{
-  "event": "document.saved",
-  "document_id": "doc_20260702abc123",
-  "external_id": "contract-2024-001",
-  "status": "ready",
-  "file_type": "docx",
-  "file_size_bytes": 45678,
-  "edited_at": "2026-07-02T14:30:00Z"
-}
+{ "event": "document.saved", "document_id": "doc_xxx", "status": "ready" }
 ```
 
-## 协同编辑
-
-Gateway 不破坏协同编辑。Document Server 的 Operational Transformation 引擎负责所有实时同步逻辑。
-
-| 风险 | 缓解 |
-|---|---|
-| Callback 风暴（多人频繁进出） | 仅 status=2/6 触发 webhook |
-| document.key 不一致导致无法协同 | 首次生成后持久化，所有请求复用同一个 key |
-| TTL 在长编辑会话中过期 | status=1 自动续期 |
-| Callback 竞态（短时间内多次保存） | 200ms debounce 去重 |
-
-详见 [ONLYOFFICE Gateway — 项目计划任务书](docs/ONLYOFFICE%20Gateway%20—%20项目计划任务书.md)。
+Gateway 对 Webhook 做有限重试（3 次，指数退避），失败后静默。
 
 ## 部署
 
 ### 本地开发
 
 ```bash
+# 终端 1: 启动网关
 make run
+
+# 终端 2: 启动管理端
+make frontend-dev
 ```
 
-### Docker
+### Docker Compose
 
 ```bash
-docker build -t onlyoffice-gateway .
-docker run -p 18080:18080 \
-  -v $(pwd)/gateway.yaml:/app/gateway.yaml:ro \
-  -v gateway-data:/app/data \
-  onlyoffice-gateway
+cp .env.example .env
+# 编辑 .env，至少设置 JWT_SECRET 和 ADMIN_PASSWORD
+docker compose up -d
 ```
 
-### Document Server 本机 Docker 配置
+管理端 build 产物位于 `admin-ui/dist/`，可部署到任意静态文件服务器或 CDN。Vite dev server 代理 `/admin/api` 到 Gateway 后端。
 
-如果 Document Server 以 Docker 容器运行在本机，Gateway 需绑定 `0.0.0.0`（而非 `127.0.0.1`），使容器能通过 `host.docker.internal` 访问 Gateway：
+### 生产部署
 
-```yaml
-listen_addr: "0.0.0.0:18080"
-document_server_url: "http://localhost:8080"
-```
+网关配置全部通过 `.env` 环境变量注入：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LISTEN_ADDR` | `:18080` | 监听地址 |
+| `DOCUMENT_SERVER_URL` | — | Document Server 地址 |
+| `JWT_SECRET` | — | 与 Document Server 共用 |
+| `STORAGE_DIR` | `./data/storage` | 文件存储路径 |
+| `TTL_HOURS` | `8` | 文档存活时间 |
+| `WEBHOOK_MAX_RETRIES` | `3` | Webhook 最大重试次数 |
+| `ADMIN_USERNAME` | `admin` | 管理端用户名 |
+| `ADMIN_PASSWORD` | — | **必须设置** |
+| `SERVICE_STORE_PATH` | `./data/services.json` | Service 持久化文件 |
 
 ## 开发
 
 ```bash
-# 安装依赖
-go mod tidy
-
-# 运行测试（Go + 前端）
-make test
-cd frontend-sdk && npm test
-
-# 同步版本
-make sync-version
-
-# 构建
-make build
+make test             # Go 测试
+make build            # 构建 Go binary
+make frontend-build   # 构建管理端 SPA
+make frontend-dev     # 启动管理端 dev server
 ```
 
 ### 技术栈
 
 | 层 | 技术 |
 |---|---|
-| Gateway 后端 | Go 1.22+, 标准库 HTTP router |
+| 后端 | Go 1.22+, 标准库 HTTP router |
+| 认证 | JWT RS256（服务自签）+ HMAC（webhook 签名 + admin session） |
 | 存储 | 本地磁盘（接口预留 S3/MinIO） |
-| 认证 | JWT RS256（服务自签） + HMAC（webhook 签名） |
-| 前端 SDK | React 18, TypeScript, Vitest + jsdom |
+| 管理端 | React 18 + Vite + shadcn/ui |
+| SDK | React 18, TypeScript, Vitest + jsdom |
 
 ### 项目结构
 
 ```
 .
-├── cmd/gateway/main.go           # 入口
+├── cmd/gateway/                   # 入口
 ├── internal/
-│   ├── config/config.go          # YAML 配置 + 公钥解析
-│   ├── configbuilder/builder.go  # OO config 分层 merge
-│   ├── gateway/server.go         # HTTP router
-│   ├── handler/
-│   │   ├── upload.go             # POST /api/v1/documents
-│   │   ├── download.go           # GET /api/v1/documents/{id}
-│   │   ├── callback.go           # POST /callback + webhook
-│   │   ├── editor.go             # GET /edit (HTML 页面)
-│   │   └── helpers.go            # 工具函数
-│   ├── jwt/jwt.go                # RS256 验签
-│   ├── storage/
-│   │   ├── interface.go          # Store 接口（预留 S3）
-│   │   └── local.go              # 本地磁盘实现
-│   └── version/version.go        # 构建版本
-├── frontend-sdk/                 # npm 包 @zenmind/onlyoffice-editor
-│   └── src/OnlyOfficeEditor.tsx
-├── gateway.yaml.example          # 配置模板
-├── VERSION                       # 版本号
+│   ├── admin/                     # Admin API（登录、Service CRUD、持久化）
+│   ├── config/                    # 配置加载（YAML + 环境变量）
+│   ├── configbuilder/             # ONLYOFFICE config 分层 merge
+│   ├── gateway/                   # HTTP router + ServiceResolver 接口
+│   ├── handler/                   # 业务 API handlers
+│   ├── jwt/                       # JWT RS256 验签
+│   ├── storage/                   # 文件存储接口 + 本地实现
+│   └── version/                   # 构建版本
+├── admin-ui/                      # 管理端 SPA（Vite + shadcn/ui）
+│   └── src/
+│       ├── pages/LoginPage.tsx
+│       ├── pages/ServicesPage.tsx
+│       ├── lib/api.ts             # API 客户端
+│       └── components/ui/         # shadcn/ui 组件
+├── frontend-sdk/                  # npm 包 @zenmind/onlyoffice-editor
+├── .env.example                   # 环境变量模板
+├── gateway.yaml.example           # YAML 配置参考（非必须）
 ├── Makefile
 ├── Dockerfile
 └── docs/
-    └── ONLYOFFICE Gateway — 项目计划任务书.md
 ```
 
 ### 测试
@@ -317,11 +300,9 @@ make build
 ```
 $ go test ./... -count=1
 ok  cmd/gateway                (1 test)
-ok  internal/configbuilder      (3 tests)
+ok  internal/admin             (13 tests)
+ok  internal/configbuilder     (3 tests)
 ok  internal/gateway           (17 tests)
-
-$ cd frontend-sdk && npm test
- ✓ src/OnlyOfficeEditor.test.tsx  (6 tests)
 ```
 
 ## License

@@ -1,8 +1,9 @@
 package gateway
 
 import (
-	"io"
+	"crypto/rsa"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
@@ -10,7 +11,12 @@ import (
 	"github.com/zenmind/onlyoffice-gateway/internal/storage"
 )
 
-func NewHandler(cfg *config.Config) http.Handler {
+// ServiceResolver provides access to registered services and their public keys.
+type ServiceResolver interface {
+	Resolve(id string) (*rsa.PublicKey, []string, bool)
+}
+
+func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 	store, err := storage.NewLocalStore(cfg.StorageDir)
 	if err != nil {
 		panic("failed to create storage: " + err.Error())
@@ -18,7 +24,7 @@ func NewHandler(cfg *config.Config) http.Handler {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("POST /api/v1/documents", handler.NewUploadHandler(cfg, store))
+	mux.Handle("POST /api/v1/documents", handler.NewUploadHandler(cfg, resolver, store))
 
 	mux.HandleFunc("GET /api/v1/documents/{id}", func(w http.ResponseWriter, r *http.Request) {
 		handler.NewDownloadHandler(store).ServeHTTP(w, r)
@@ -27,7 +33,7 @@ func NewHandler(cfg *config.Config) http.Handler {
 	mux.Handle("POST /callback", handler.NewCallbackHandler(store, cfg.WebhookMaxRetries, cfg.JWTSecret))
 
 	mux.HandleFunc("GET /edit", func(w http.ResponseWriter, r *http.Request) {
-		editor := handler.NewEditorHandler(cfg, store, getServerURL(r))
+		editor := handler.NewEditorHandler(cfg, resolver, store, getServerURL(r))
 		editor.ServeHTTP(w, r)
 	})
 
@@ -43,7 +49,6 @@ func NewHandler(cfg *config.Config) http.Handler {
 		io.Copy(w, reader)
 	})
 
-	
 	mux.HandleFunc("GET /api/v1/health/ds", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		dsURL := cfg.DocumentServerURL + "/healthcheck"
@@ -60,7 +65,7 @@ func NewHandler(cfg *config.Config) http.Handler {
 		fmt.Fprintf(w, `{"document_server_ok":%t,"document_server_url":"%s"}`, ok, cfg.DocumentServerURL)
 	})
 
-mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})

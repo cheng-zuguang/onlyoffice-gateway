@@ -8,28 +8,21 @@ services:
     restart: unless-stopped
 
     environment:
-      # ── JWT ──────────────────────────────────────────────────
       JWT_ENABLED: ${JWT_ENABLED:-true}
       JWT_SECRET:  ${JWT_SECRET:-}
       JWT_HEADER:  ${JWT_HEADER:-Authorization}
       JWT_IN_BODY: ${JWT_IN_BODY:-false}
-
-      # ── 网络 ─────────────────────────────────────────────────
       ALLOW_PRIVATE_IP_ADDRESS: ${ALLOW_PRIVATE_IP_ADDRESS:-true}
       ALLOW_META_IP_ADDRESS:    ${ALLOW_META_IP_ADDRESS:-true}
       USE_UNAUTHORIZED_STORAGE: ${USE_UNAUTHORIZED_STORAGE:-true}
-
-      # ── 优化 ─────────────────────────────────────────────────
       EXAMPLE_ENABLED: ${EXAMPLE_ENABLED:-true}
       METRICS_ENABLED: ${METRICS_ENABLED:-false}
       DS_LOG_LEVEL:    ${DS_LOG_LEVEL:-warn}
-
-      # ── 字体 / WOPI ──────────────────────────────────────────
       GENERATE_FONTS: ${GENERATE_FONTS:-true}
       WOPI_ENABLED:   ${WOPI_ENABLED:-false}
 
     ports:
-      - "${DS_PORT:-8080}:80"
+      - "${DS_PORT:-18000}:18000"
 
     volumes:
       - ds-data:/var/www/onlyoffice/Data
@@ -47,7 +40,7 @@ services:
     stop_grace_period: 60s
 
   # =========================================================================
-  # ONLYOFFICE Gateway
+  # ONLYOFFICE Gateway (API)
   # =========================================================================
   gateway:
     build:
@@ -60,13 +53,17 @@ services:
     restart: unless-stopped
 
     environment:
-      JWT_SECRET: ${JWT_SECRET:-}
-
-    ports:
-      - "${GATEWAY_PORT:-18080}:18080"
+      JWT_SECRET:          ${JWT_SECRET:-}
+      LISTEN_ADDR:         0.0.0.0:18080
+      DOCUMENT_SERVER_URL: http://document-server
+      STORAGE_DIR:         /app/data
+      TTL_HOURS:           ${TTL_HOURS:-8}
+      WEBHOOK_MAX_RETRIES: ${WEBHOOK_MAX_RETRIES:-3}
+      ADMIN_USERNAME:      ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD:      ${ADMIN_PASSWORD:-}
+      SERVICE_STORE_PATH:  /app/data/services.json
 
     volumes:
-      - ./gateway.yaml:/app/gateway.yaml:ro
       - gateway-data:/app/data
 
     depends_on:
@@ -74,13 +71,29 @@ services:
         condition: service_healthy
 
     healthcheck:
-      test:     ["CMD", "curl", "-f", "http://localhost:18080/api/v1/health"]
+      test:     ["CMD", "wget", "-qO-", "http://localhost:18080/api/v1/health"]
       interval: 15s
       timeout:  5s
       retries:  3
       start_period: 5s
 
     stop_grace_period: 10s
+
+  # =========================================================================
+  # Admin UI (SPA served by nginx, proxying /admin/api to gateway)
+  # =========================================================================
+  admin-ui:
+    build:
+      context: ./admin-ui
+    container_name: oo-admin-ui
+    restart: unless-stopped
+
+    ports:
+      - "${ADMIN_UI_PORT:-18081}:18081"
+
+    depends_on:
+      gateway:
+        condition: service_healthy
 
 volumes:
   ds-data:

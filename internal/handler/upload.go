@@ -11,12 +11,13 @@ import (
 )
 
 type UploadHandler struct {
-	cfg   *config.Config
-	store storage.Store
+	cfg      *config.Config
+	resolver gwjwt.ServiceResolver
+	store    storage.Store
 }
 
-func NewUploadHandler(cfg *config.Config, store storage.Store) *UploadHandler {
-	return &UploadHandler{cfg: cfg, store: store}
+func NewUploadHandler(cfg *config.Config, resolver gwjwt.ServiceResolver, store storage.Store) *UploadHandler {
+	return &UploadHandler{cfg: cfg, resolver: resolver, store: store}
 }
 
 func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -32,7 +33,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claims, err := gwjwt.VerifyServiceJWT(h.cfg, token)
+	claims, err := gwjwt.VerifyServiceJWT(h.resolver, token)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
@@ -47,8 +48,8 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Validate webhook domain
 	if serviceID != "" {
-		svc, _ := h.cfg.GetService(serviceID)
-		if svc != nil && !svc.IsWebhookDomainAllowed(webhookURL) {
+		_, domains, found := h.resolver.Resolve(serviceID)
+		if found && !isDomainAllowed(domains, webhookURL) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "webhook domain not allowed"})
 			return
 		}
@@ -70,16 +71,16 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	meta := storage.Meta{
 		Branding:        claims["branding"],
 		ConfigOverrides: claims["config_overrides"],
-		DocumentID:   documentID,
-		ServiceID:    serviceID,
-		ExternalID:   externalID,
-		WebhookURL:   webhookURL,
-		FileName:     fileName,
-		FileType:     docTypeToFileType(docType),
-		DocumentType: docType,
-		EditorKey:    editorKey,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(time.Duration(h.cfg.TTLHours) * time.Hour),
+		DocumentID:      documentID,
+		ServiceID:       serviceID,
+		ExternalID:      externalID,
+		WebhookURL:      webhookURL,
+		FileName:        fileName,
+		FileType:        docTypeToFileType(docType),
+		DocumentType:    docType,
+		EditorKey:       editorKey,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(time.Duration(h.cfg.TTLHours) * time.Hour),
 	}
 
 	if err := h.store.Put(documentID, file, meta); err != nil {
@@ -92,6 +93,37 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"status":      "uploaded",
 		"expires_at":  meta.ExpiresAt.Format(time.RFC3339),
 	})
+}
+
+func isDomainAllowed(allowedDomains []string, rawURL string) bool {
+	if len(allowedDomains) == 0 {
+		return false
+	}
+	fromURL := rawURL
+	if len(fromURL) > 8 && fromURL[:8] == "https://" {
+		fromURL = fromURL[8:]
+	} else if len(fromURL) > 7 && fromURL[:7] == "http://" {
+		fromURL = fromURL[7:]
+	}
+	host := fromURL
+	for i, c := range fromURL {
+		if c == '/' || c == ':' || c == '?' {
+			host = fromURL[:i]
+			break
+		}
+	}
+	for _, d := range allowedDomains {
+		if host == d {
+			return true
+		}
+	}
+	return false
+}
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }
 
 func generateDocID() string {
@@ -113,10 +145,4 @@ func docTypeToFileType(docType string) string {
 	default:
 		return "pdf"
 	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
 }

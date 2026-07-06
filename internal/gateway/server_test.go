@@ -5,23 +5,24 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
-	"encoding/json"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/zenmind/onlyoffice-gateway/internal/admin"
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
 	"github.com/zenmind/onlyoffice-gateway/internal/gateway"
-	"fmt"
-	"strings"
-	"sync"
 	"github.com/zenmind/onlyoffice-gateway/internal/storage"
 )
 
@@ -59,12 +60,8 @@ func signUploadJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) str
 	return signed
 }
 
-// Tracer Bullet: business service uploads a document with valid JWT,
-// Gateway stores it, returns 201 + document_id.
-func TestUploadDocument(t *testing.T) {
-	// --- Arrange ---
-	privPEM, pubPEM := generateRSAKeyPair(t)
-
+func setupGateway(t *testing.T, privPEM, pubPEM string, whitelist []string) (*httptest.Server, string, *admin.InMemoryServiceStore) {
+	t.Helper()
 	tmpDir := t.TempDir()
 	storageDir := filepath.Join(tmpDir, "storage")
 
@@ -75,24 +72,28 @@ func TestUploadDocument(t *testing.T) {
 		StorageDir:        storageDir,
 		TTLHours:          8,
 		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{
-				ID:                    "test-service",
-				PublicKeyPEM:          pubPEM,
-				AllowedWebhookDomains: []string{"test.example.com"},
-			},
-		},
 	}
-	loaded, err := config.FromLiteral(cfg)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
+	loaded, _ := config.FromLiteral(cfg)
 
-	handler := gateway.NewHandler(loaded)
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: whitelist,
+	})
+
+	handler := gateway.NewHandler(loaded, store)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
+	return server, storageDir, store
+}
 
-	// Build upload JWT
+// Tracer Bullet: business service uploads a document with valid JWT,
+// Gateway stores it, returns 201 + document_id.
+func TestUploadDocument(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
 	uploadJWT := signUploadJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
 		"webhook_url": "https://test.example.com/callback",
@@ -107,20 +108,17 @@ func TestUploadDocument(t *testing.T) {
 		"iat":           time.Now().Unix(),
 	})
 
-	// Build multipart body
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	part, _ := writer.CreateFormFile("file", "test.docx")
 	io.WriteString(part, "fake-docx-content")
 	writer.Close()
 
-	// --- Act ---
 	req, _ := http.NewRequest("POST", server.URL+"/api/v1/documents", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+uploadJWT)
 	resp, err := http.DefaultClient.Do(req)
 
-	// --- Assert ---
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -131,7 +129,6 @@ func TestUploadDocument(t *testing.T) {
 		t.Fatalf("expected 201 Created, got %d\nbody: %s", resp.StatusCode, string(respBody))
 	}
 
-	// Verify file stored on disk
 	entries, _ := os.ReadDir(storageDir)
 	found := false
 	for _, e := range entries {
@@ -148,27 +145,8 @@ func TestUploadDocument(t *testing.T) {
 // S2: Upload with expired JWT returns 401 Unauthorized.
 func TestUploadRejectsInvalidJWT(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// Expired JWT (exp = 1 second ago)
 	expiredJWT := signUploadJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
 		"webhook_url": "https://test.example.com/callback",
@@ -198,27 +176,8 @@ func TestUploadRejectsInvalidJWT(t *testing.T) {
 // S3: Upload with webhook domain not in whitelist returns 403.
 func TestUploadRejectsUnauthorizedDomain(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"only-trusted.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"only-trusted.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// webhook_url points to a domain NOT in the whitelist
 	validJWT := signUploadJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
 		"webhook_url": "https://evil.example.com/exfiltrate",
@@ -248,29 +207,10 @@ func TestUploadRejectsUnauthorizedDomain(t *testing.T) {
 // S4: Download while still editing returns 409 Conflict.
 func TestDownloadReturns409WhileEditing(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// Upload a document first
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
-	// Try downloading before editing
 	req, _ := http.NewRequest("GET", server.URL+"/api/v1/documents/"+docID, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -284,16 +224,15 @@ func TestDownloadReturns409WhileEditing(t *testing.T) {
 	}
 }
 
-// Helper: uploadTestDocument uploads a file and returns the document_id.
 func uploadTestDocument(t *testing.T, serverURL, privPEM, serviceID, webhookURL string) string {
 	t.Helper()
 	jwtToken := signUploadJWT(t, privPEM, jwt.MapClaims{
-		"service_id":  serviceID,
-		"webhook_url": webhookURL,
-		"file_name":   "test.docx",
+		"service_id":    serviceID,
+		"webhook_url":   webhookURL,
+		"file_name":     "test.docx",
 		"document_type": "word",
-		"exp":         time.Now().Add(60 * time.Second).Unix(),
-		"iat":         time.Now().Unix(),
+		"exp":           time.Now().Add(60 * time.Second).Unix(),
+		"iat":           time.Now().Unix(),
 	})
 
 	var buf bytes.Buffer
@@ -309,7 +248,6 @@ func uploadTestDocument(t *testing.T, serverURL, privPEM, serviceID, webhookURL 
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	// Parse document_id from response
 	var result map[string]interface{}
 	json.Unmarshal(respBody, &result)
 	docID, _ := result["document_id"].(string)
@@ -322,32 +260,11 @@ func uploadTestDocument(t *testing.T, serverURL, privPEM, serviceID, webhookURL 
 // S5: Download returns edited document with 200.
 func TestDownloadDocument(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// Upload
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
-
-	// Manually mark as edited (simulates callback having processed the file)
 	markDocumentEdited(t, storageDir, docID, "edited file content")
 
-	// Download
 	req, _ := http.NewRequest("GET", server.URL+"/api/v1/documents/"+docID, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -369,21 +286,7 @@ func TestDownloadDocument(t *testing.T) {
 // S6: Download nonexistent document returns 404.
 func TestDownloadReturns404ForMissing(t *testing.T) {
 	_, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
-
-	cfg := &config.Config{
-		ListenAddr:   "127.0.0.1:18080",
-		StorageDir:   storageDir,
-		TTLHours:     8,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, _, _ := setupGateway(t, "unused", pubPEM, []string{"test.example.com"})
 
 	req, _ := http.NewRequest("GET", server.URL+"/api/v1/documents/doc-nonexistent", nil)
 	resp, _ := http.DefaultClient.Do(req)
@@ -394,12 +297,10 @@ func TestDownloadReturns404ForMissing(t *testing.T) {
 	}
 }
 
-// markDocumentEdited writes an edited file and meta to storage.
 func markDocumentEdited(t *testing.T, storageDir, documentID, content string) {
 	t.Helper()
 	dir := filepath.Join(storageDir, documentID)
 	os.WriteFile(filepath.Join(dir, "edited.docx"), []byte(content), 0644)
-	// Also update meta.json to set is_edited = true
 	metaPath := filepath.Join(dir, "meta.json")
 	data, _ := os.ReadFile(metaPath)
 	var meta map[string]interface{}
@@ -412,36 +313,16 @@ func markDocumentEdited(t *testing.T, storageDir, documentID, content string) {
 // S7: ONLYOFFICE callback (status=2) saves the edited document.
 func TestOOCallbackSavesDocument(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// Upload a document
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
-	// Simulate a file from ONLYOFFICE Document Server
 	editedContent := []byte("edited-by-onlyoffice")
 	fakeDocServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write(editedContent)
 	}))
 	defer fakeDocServer.Close()
 
-	// Send callback (status=2: ready for saving)
 	callbackBody := bytes.NewReader(toJSON(map[string]interface{}{
 		"status": 2,
 		"key":    docID,
@@ -456,10 +337,8 @@ func TestOOCallbackSavesDocument(t *testing.T) {
 		t.Fatalf("expected callback to return 200 OK, got %d", resp.StatusCode)
 	}
 
-	// Wait for debounce (200ms window) + async processing
 	time.Sleep(500 * time.Millisecond)
 
-	// Verify document is now marked as edited
 	req2, _ := http.NewRequest("GET", server.URL+"/api/v1/documents/"+docID, nil)
 	resp2, _ := http.DefaultClient.Do(req2)
 	defer resp2.Body.Close()
@@ -482,24 +361,7 @@ func toJSON(v interface{}) []byte {
 // S8: Callback debounce — rapid callbacks only process the latest.
 func TestOOCallbackDebounce(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
-
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
@@ -508,7 +370,6 @@ func TestOOCallbackDebounce(t *testing.T) {
 	}))
 	defer fakeServer.Close()
 
-	// Send 3 rapid callbacks
 	for i := 0; i < 3; i++ {
 		body := bytes.NewReader(toJSON(map[string]interface{}{
 			"status": 2, "key": docID, "url": fakeServer.URL + "/file.docx",
@@ -518,10 +379,8 @@ func TestOOCallbackDebounce(t *testing.T) {
 		http.DefaultClient.Do(req)
 	}
 
-	// Allow time for debounce (200ms) + processing
 	time.Sleep(500 * time.Millisecond)
 
-	// Final download should return the latest content
 	req, _ := http.NewRequest("GET", server.URL+"/api/v1/documents/"+docID, nil)
 	resp, _ := http.DefaultClient.Do(req)
 	defer resp.Body.Close()
@@ -538,28 +397,10 @@ func TestOOCallbackDebounce(t *testing.T) {
 // S11: TTL extends when status=1 callback is received.
 func TestTTLExtendOnEditing(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
-
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          1,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
-	// Simulate user connecting (status=1)
 	body := bytes.NewReader(toJSON(map[string]interface{}{
 		"status": 1, "key": docID, "users": []string{"user-1"},
 	}))
@@ -568,7 +409,6 @@ func TestTTLExtendOnEditing(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	// Verify meta shows updated TTL
 	metaPath := filepath.Join(storageDir, docID, "meta.json")
 	data, _ := os.ReadFile(metaPath)
 	var meta map[string]interface{}
@@ -577,7 +417,6 @@ func TestTTLExtendOnEditing(t *testing.T) {
 	expiresStr, _ := meta["expires_at"].(string)
 	expiresAt, _ := time.Parse(time.RFC3339, expiresStr)
 
-	// TTL should be ~1 hour from now (not from creation)
 	if time.Until(expiresAt) < 55*time.Minute {
 		t.Fatalf("expected TTL to be extended to ~1 hour from now, got %s", expiresStr)
 	}
@@ -586,26 +425,7 @@ func TestTTLExtendOnEditing(t *testing.T) {
 // S9: Webhook retries on failure, then gives up.
 func TestWebhookRetriesThenGivesUp(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com", "127.0.0.1"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// Webhook receiver that always returns 500
 	attempts := 0
 	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -613,9 +433,14 @@ func TestWebhookRetriesThenGivesUp(t *testing.T) {
 	}))
 	defer webhookServer.Close()
 
+	whHost := strings.TrimPrefix(webhookServer.URL, "http://")
+	whHost = whHost[:len(whHost)-len(":"+strings.Split(whHost, ":")[len(strings.Split(whHost, ":"))-1])]
+	domain := "127.0.0.1"
+
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com", domain})
+
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", webhookServer.URL+"/callback")
 
-	// Send callback to trigger webhook delivery
 	editedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("edited"))
 	}))
@@ -629,13 +454,11 @@ func TestWebhookRetriesThenGivesUp(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	// Wait for retry attempts to finish (exponential backoff)
 	time.Sleep(5 * time.Second)
 
 	if attempts < 1 {
 		t.Fatalf("expected at least 1 webhook attempt, got %d", attempts)
 	}
-	// After max retries, attempts should stop at 1+retries (at least 1 attempt)
 	if attempts > 5 {
 		t.Fatalf("expected at most 4 attempts (1 + 3 retries), got %d", attempts)
 	}
@@ -644,24 +467,7 @@ func TestWebhookRetriesThenGivesUp(t *testing.T) {
 // S10: Editor page returns valid HTML with api.js and placeholder.
 func TestEditorPageReturnsHTML(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
-
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
@@ -699,6 +505,7 @@ func TestEditorPageReturnsHTML(t *testing.T) {
 // S12: Expired documents are cleaned up.
 func TestExpiredDocumentCleaned(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
+
 	tmpDir := t.TempDir()
 	storageDir := filepath.Join(tmpDir, "storage")
 
@@ -707,20 +514,24 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 		DocumentServerURL: "https://doc.example.com",
 		JWTSecret:         "test-gateway-jwt-secret",
 		StorageDir:        storageDir,
-		TTLHours:          -1, // Immediately expired
+		TTLHours:          -1,
 		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
 	}
 	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	handler := gateway.NewHandler(loaded, store)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
-	// Verify document exists
 	editToken := signJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
 		"document_id": docID,
@@ -734,10 +545,8 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 		t.Fatalf("expected document to exist before cleanup, got %d", resp.StatusCode)
 	}
 
-	// Trigger cleanup (via Expire directly on storage)
-	// Since TTL is -1, the document should be expired
-	store, _ := storage.NewLocalStore(storageDir)
-	count, err := store.Expire()
+	storageStore, _ := storage.NewLocalStore(storageDir)
+	count, err := storageStore.Expire()
 	if err != nil {
 		t.Fatalf("expire failed: %v", err)
 	}
@@ -745,7 +554,6 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 		t.Fatal("expected at least 1 expired document to be cleaned")
 	}
 
-	// Verify document is gone
 	req2, _ := http.NewRequest("GET", server.URL+"/edit?token="+editToken, nil)
 	resp2, _ := http.DefaultClient.Do(req2)
 	resp2.Body.Close()
@@ -754,8 +562,12 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 	}
 }
 
-func min(a, b int) int { if a < b { return a }; return b }
-
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
@@ -767,28 +579,10 @@ func truncate(s string, n int) string {
 // S24: Callback debounce — rapid callbacks within 200ms only process the last.
 func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
-
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 0,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
-	// Create a persistent fake server that returns different content based on version
 	var versionLock sync.Mutex
 	currentVersion := "version-1"
 	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -811,10 +605,8 @@ func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 		http.DefaultClient.Do(req)
 	}
 
-	// Wait for debounce (200ms window) + async processing
 	time.Sleep(600 * time.Millisecond)
 
-	// Verify only the last callback's content was saved
 	editedPath := filepath.Join(storageDir, docID, "edited.docx")
 	data, err := os.ReadFile(editedPath)
 	if err != nil {
@@ -824,11 +616,10 @@ func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 		t.Fatalf("expected version-5 from last (debounced) callback, got: %s", string(data))
 	}
 }
+
 // S25: Webhook POST includes X-Gateway-Signature HMAC header.
 func TestWebhookIncludesSignature(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
 
 	var receivedSig string
 	var receivedBody string
@@ -840,26 +631,8 @@ func TestWebhookIncludesSignature(t *testing.T) {
 	}))
 	defer webhookServer.Close()
 
-	whHost := webhookServer.URL[7:] // strip "http://"
-	whHost = whHost[:len(whHost)-len(":"+strings.Split(whHost, ":")[len(strings.Split(whHost, ":"))-1])]
-	// Just use 127.0.0.1 as host
 	domain := "127.0.0.1"
-
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 0,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com", domain}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com", domain})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", webhookServer.URL+"/callback")
 
@@ -876,7 +649,6 @@ func TestWebhookIncludesSignature(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	// Wait for webhook delivery
 	time.Sleep(500 * time.Millisecond)
 
 	if receivedSig == "" {
@@ -893,23 +665,8 @@ func TestWebhookIncludesSignature(t *testing.T) {
 // S26: /edit without valid token returns 401.
 func TestEditRequiresValidToken(t *testing.T) {
 	_, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, _, _ := setupGateway(t, "unused", pubPEM, []string{"test.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:   "127.0.0.1:18080",
-		StorageDir:   storageDir,
-		TTLHours:     8,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// No token at all
 	req, _ := http.NewRequest("GET", server.URL+"/edit?document_id=doc-123", nil)
 	resp, _ := http.DefaultClient.Do(req)
 	defer resp.Body.Close()
@@ -918,30 +675,13 @@ func TestEditRequiresValidToken(t *testing.T) {
 		t.Fatalf("expected 401 for missing token, got %d", resp.StatusCode)
 	}
 }
+
 func TestEditAcceptsValidToken(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
-
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
-	// Sign a JWT with document_id
 	editToken := signJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
 		"document_id": docID,
@@ -982,34 +722,15 @@ func signJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) string {
 	return signed
 }
 
-
 // S28: /edit page renders branding from upload JWT via config builder.
 func TestEditRendersBrandingFromUpload(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	tmpDir := t.TempDir()
-	storageDir := filepath.Join(tmpDir, "storage")
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
-	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test-service", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"test.example.com"}},
-		},
-	}
-	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	// Upload with branding in JWT
 	brandedJWT := signJWT(t, privPEM, jwt.MapClaims{
-		"service_id":  "test-service",
-		"webhook_url": "https://test.example.com/callback",
-		"file_name":   "branded.docx",
+		"service_id":    "test-service",
+		"webhook_url":   "https://test.example.com/callback",
+		"file_name":     "branded.docx",
 		"document_type": "word",
 		"branding": map[string]interface{}{
 			"logo_url":    "https://test.example.com/logo.png",
@@ -1039,7 +760,6 @@ func TestEditRendersBrandingFromUpload(t *testing.T) {
 		t.Fatal("no document_id in upload response")
 	}
 
-	// Open /edit with a valid token
 	editToken := signJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
 		"document_id": docID,
@@ -1055,10 +775,9 @@ func TestEditRendersBrandingFromUpload(t *testing.T) {
 	htmlStr := string(html)
 
 	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", resp2.StatusCode, htmlStr[:min(len(htmlStr),200)])
+		t.Fatalf("expected 200, got %d: %s", resp2.StatusCode, htmlStr[:min(len(htmlStr), 200)])
 	}
 
-	// Branding should be rendered into the ONLYOFFICE config
 	if !contains(htmlStr, "https://test.example.com/logo.png") {
 		t.Fatalf("expected logo_url in editor HTML, got: %s", truncate(htmlStr, 400))
 	}
@@ -1084,12 +803,17 @@ func TestDocumentServerHealthCheck(t *testing.T) {
 		StorageDir:        filepath.Join(tmpDir, "storage"),
 		TTLHours:          8,
 		WebhookMaxRetries: 3,
-		Services: []config.ServiceConfig{
-			{ID: "test", PublicKeyPEM: pubPEM, AllowedWebhookDomains: []string{"localhost"}},
-		},
 	}
 	loaded, _ := config.FromLiteral(cfg)
-	handler := gateway.NewHandler(loaded)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"localhost"},
+	})
+
+	handler := gateway.NewHandler(loaded, store)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
@@ -1111,6 +835,7 @@ func TestDocumentServerHealthCheck(t *testing.T) {
 		t.Fatalf("expected document_server_ok=true, got: %v", result)
 	}
 }
+
 func contains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
@@ -1119,4 +844,3 @@ func contains(s, substr string) bool {
 	}
 	return false
 }
-

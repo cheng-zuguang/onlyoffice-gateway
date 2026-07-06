@@ -1,29 +1,32 @@
 package jwt
 
 import (
+	"crypto/rsa"
 	"errors"
 	"fmt"
 
 	golangjwt "github.com/golang-jwt/jwt/v5"
-	"github.com/zenmind/onlyoffice-gateway/internal/config"
 )
 
 var (
-	ErrNoToken       = errors.New("missing authorization header")
-	ErrInvalidToken  = errors.New("invalid token")
+	ErrNoToken        = errors.New("missing authorization header")
+	ErrInvalidToken   = errors.New("invalid token")
 	ErrServiceNotFound = errors.New("service not found")
 )
 
-// VerifyServiceJWT validates a JWT signed by the service's private key
-// against the corresponding public key in the Gateway config.
+// ServiceResolver provides access to registered services and their public keys.
+type ServiceResolver interface {
+	Resolve(id string) (*rsa.PublicKey, []string, bool)
+}
+
+// VerifyServiceJWT validates a JWT signed by the service's private key.
 // Returns the parsed claims on success.
-func VerifyServiceJWT(cfg *config.Config, tokenString string) (golangjwt.MapClaims, error) {
+func VerifyServiceJWT(resolver ServiceResolver, tokenString string) (golangjwt.MapClaims, error) {
 	parser := golangjwt.NewParser()
 	token, err := parser.Parse(tokenString, func(t *golangjwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*golangjwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
-		// Extract service_id from claims to look up the right public key
 		claims, ok := t.Claims.(golangjwt.MapClaims)
 		if !ok {
 			return nil, fmt.Errorf("invalid claims")
@@ -32,11 +35,11 @@ func VerifyServiceJWT(cfg *config.Config, tokenString string) (golangjwt.MapClai
 		if serviceID == "" {
 			return nil, fmt.Errorf("missing service_id in claims")
 		}
-		svc, err := cfg.GetService(serviceID)
-		if err != nil {
-			return nil, err
+		pubKey, _, found := resolver.Resolve(serviceID)
+		if !found {
+			return nil, ErrServiceNotFound
 		}
-		return svc.PublicKey(), nil
+		return pubKey, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
