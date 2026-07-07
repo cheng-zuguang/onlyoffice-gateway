@@ -22,7 +22,7 @@ services:
       WOPI_ENABLED:   ${WOPI_ENABLED:-false}
 
     ports:
-      - "${DS_PORT:-18000}:18000"
+      - "${DS_PORT:-18000}:80"
 
     volumes:
       - ds-data:/var/www/onlyoffice/Data
@@ -63,6 +63,9 @@ services:
       ADMIN_PASSWORD:      ${ADMIN_PASSWORD:-}
       SERVICE_STORE_PATH:  /app/data/services.json
 
+    ports:
+      - "${GATEWAY_PORT:-18080}:18080"
+
     volumes:
       - gateway-data:/app/data
 
@@ -89,7 +92,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${ADMIN_UI_PORT:-18081}:18081"
+      - "${ADMIN_UI_PORT:-18081}:80"
 
     depends_on:
       gateway:
