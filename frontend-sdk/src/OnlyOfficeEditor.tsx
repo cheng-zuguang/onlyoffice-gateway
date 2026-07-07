@@ -12,6 +12,8 @@ interface ErrorEvent {
 interface OnlyOfficeEditorProps {
   documentId: string;
   gatewayUrl: string;
+  token?: string;
+  mode?: "edit" | "view";
   onReady?: () => void;
   onSaved?: (event: SavedEvent) => void;
   onError?: (event: ErrorEvent) => void;
@@ -21,6 +23,8 @@ interface OnlyOfficeEditorProps {
 export function OnlyOfficeEditor({
   documentId,
   gatewayUrl,
+  token,
+  mode,
   onReady,
   onSaved,
   onError,
@@ -50,20 +54,27 @@ export function OnlyOfficeEditor({
     return () => window.removeEventListener("message", handler);
   }, [onReady, onSaved, onError]);
 
+  const params = new URLSearchParams({ document_id: documentId });
+  if (token) params.set("token", token);
+  if (mode && mode !== "edit") params.set("mode", mode);
+
   return (
     <iframe
-      src={`${gatewayUrl}/edit?document_id=${documentId}`}
+      src={`${gatewayUrl}/edit?${params.toString()}`}
       style={{
         width: "100%",
         height: "600px",
         border: "none",
         ...style,
       }}
+      key={`${documentId}-${token || ""}-${mode || "edit"}`}
       title="ONLYOFFICE Editor"
     />
   );
 }
 
 export type { SavedEvent, ErrorEvent, OnlyOfficeEditorProps };
+
+export type OnlyOfficeEditorMode = "edit" | "view";
 
 export const VERSION = "0.1.0";

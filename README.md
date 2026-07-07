@@ -186,7 +186,7 @@ Admin API 使用 HMAC-SHA256 JWT 认证（复用 `JWT_SECRET`），24h 过期。
 | `document_type` | | `word` / `cell` / `slide` / `pdf` |
 | `branding` | | 编辑器品牌定制（logo、语言、主题色） |
 | `config_overrides` | | ONLYOFFICE config 完全覆盖 |
-| `exp` | ✅ | JWT 过期时间（建议 60s） |
+| `exp` | ✅ | 上传 token 有效期，控制调用 API 的时间窗口。生成后应立即使用，建议 60s 以防范重放 |
 
 ### 编辑器定制
 

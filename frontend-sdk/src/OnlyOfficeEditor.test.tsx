@@ -111,6 +111,74 @@ describe("OnlyOfficeEditor", () => {
     expect(onSaved).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
   });
+
+  // Phase 1 — Test 1: token prop appears in /edit URL
+  it("includes the token in the iframe /edit URL", () => {
+    const { container } = render(
+      <OnlyOfficeEditor
+        documentId="doc-abc"
+        gatewayUrl="https://gateway.example.com"
+        token="jwt-token-123"
+      />
+    );
+    const iframe = container.querySelector("iframe");
+    expect(iframe!.src).toBe("https://gateway.example.com/edit?document_id=doc-abc&token=jwt-token-123");
+  });
+
+  // Phase 1 — Test 2: no mode param when mode=edit (default)
+  it("does not include mode=edit in the iframe URL by default", () => {
+    const { container } = render(
+      <OnlyOfficeEditor
+        documentId="doc-abc"
+        gatewayUrl="https://gateway.example.com"
+        mode="edit"
+      />
+    );
+    const iframe = container.querySelector("iframe");
+    expect(iframe!.src).toBe("https://gateway.example.com/edit?document_id=doc-abc");
+  });
+
+  // Phase 1 — Test 3: mode=view appends &mode=view
+  it("appends mode=view to the URL when mode is 'view'", () => {
+    const { container } = render(
+      <OnlyOfficeEditor
+        documentId="doc-abc"
+        gatewayUrl="https://gateway.example.com"
+        mode="view"
+      />
+    );
+    const iframe = container.querySelector("iframe");
+    expect(iframe!.src).toBe("https://gateway.example.com/edit?document_id=doc-abc&mode=view");
+  });
+
+
+  // Phase 1 — Test 4: iframe remounts when token or mode changes
+  it("remounts the iframe when token or mode changes", () => {
+    const { container, rerender } = render(
+      <OnlyOfficeEditor
+        documentId="doc-1"
+        gatewayUrl="https://gateway.example.com"
+        token="t1"
+        mode="edit"
+      />
+    );
+    const iframe1 = container.querySelector("iframe")!;
+
+    rerender(
+      <OnlyOfficeEditor
+        documentId="doc-1"
+        gatewayUrl="https://gateway.example.com"
+        token="t2"
+        mode="view"
+      />
+    );
+    const iframe2 = container.querySelector("iframe")!;
+
+    // Without key, React reuses the same DOM element (no remount)
+    // With key, React unmounts old + mounts new → different element
+    expect(iframe2).not.toBe(iframe1);
+    expect(iframe2.src).toBe("https://gateway.example.com/edit?document_id=doc-1&token=t2&mode=view");
+  });
 });
 
 import { VERSION as SDK_VERSION } from "./OnlyOfficeEditor";

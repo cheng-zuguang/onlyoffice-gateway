@@ -253,7 +253,7 @@ Gateway → 返回编辑后的文件二进制
 | `document_type` | string | | `word` / `cell` / `slide` / `pdf`，默认从 file_name 后缀推断 |
 | `branding` | object | | 有限定制（见 4.3 节） |
 | `config_overrides` | object | | 完全定制（预留），见 4.3 节 |
-| `exp` | number | ✅ | 过期时间（建议 60s 内） |
+| `exp` | number | ✅ | 上传 token 有效期，控制调用 API 的时间窗口。生成后应立即使用，建议 60s 以内以防范重放攻击 |
 
 **响应**:
 
@@ -377,7 +377,7 @@ Layer 3: JWT config_overrides（完全定制 - 预留）
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `document_id` | ✅ | 已上传的文档 ID |
-| `exp` | ✅ | 过期时间（建议 30min，匹配编辑超时） |
+| `exp` | ✅ | 编辑器 token 有效期，控制从生成 token 到首次加载编辑器页面的时间窗口。token 仅在浏览器请求 /edit 页面时校验一次，页面加载后不再使用。较短的过期时间可防止编辑器 URL 泄露后被长期滥用 |
 
 Gateway 返回一个完整的 HTML 页面，内嵌 ONLYOFFICE 编辑器。页面逻辑：
 
