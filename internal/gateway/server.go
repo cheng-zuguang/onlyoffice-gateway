@@ -70,7 +70,7 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	return mux
+	return LoggingMiddleware(mux)
 }
 
 func getServerURL(r *http.Request) string {
