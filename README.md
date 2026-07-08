@@ -147,6 +147,7 @@ import { OnlyOfficeEditor } from "@zenmind/onlyoffice-editor";
 | `POST` | `/api/v1/documents` | 上传文档（JWT RS256 自签） |
 | `GET` | `/api/v1/documents/{id}` | 下载编辑结果 |
 | `GET` | `/api/v1/health` | 健康检查 |
+| `GET` | `/api/v1/health/ds` | Document Server 连通性检查 |
 | `GET` | `/edit` | 编辑器 HTML 页面（iframe） |
 
 ### Document Server 内部 API
@@ -163,6 +164,7 @@ import { OnlyOfficeEditor } from "@zenmind/onlyoffice-editor";
 | `POST` | `/admin/api/login` | 无 | 管理员登录，返回 JWT |
 | `GET` | `/admin/api/services` | Bearer | 列出所有业务服务 |
 | `POST` | `/admin/api/services` | Bearer | 新增业务服务 |
+| `PUT` | `/admin/api/services/{id}` | Bearer | 更新业务服务 |
 | `DELETE` | `/admin/api/services/{id}` | Bearer | 删除业务服务 |
 
 Admin API 使用 HMAC-SHA256 JWT 认证（复用 `JWT_SECRET`），24h 过期。
@@ -248,6 +250,16 @@ docker compose up -d
 | `ADMIN_PASSWORD` | — | **必须设置** |
 | `SERVICE_STORE_PATH` | `./data/services.json` | Service 持久化文件 |
 
+### 访问日志
+
+Gateway 对业务 API、Document Server 内部 API、编辑器页面、健康检查和 Admin API 统一输出访问日志：
+
+```text
+[http] POST /admin/api/login 200 1.2ms remote_addr=127.0.0.1:54321 user_agent="curl/8.0.1" request_id=req-123
+```
+
+字段依次为：HTTP method、request URI、status、duration、remote address、User-Agent、request id。`request_id` 读取 `X-Request-Id` / `X-Request-ID`，没有时为 `-`。
+
 ## 开发
 
 ```bash
@@ -289,7 +301,6 @@ make frontend-dev     # 启动管理端 dev server
 │       └── components/ui/         # shadcn/ui 组件
 ├── frontend-sdk/                  # npm 包 @zenmind/onlyoffice-editor
 ├── .env.example                   # 环境变量模板
-├── gateway.yaml.example           # YAML 配置参考（非必须）
 ├── Makefile
 ├── Dockerfile
 └── docs/

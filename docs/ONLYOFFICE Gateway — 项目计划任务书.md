@@ -582,8 +582,8 @@ services:
 |---|---|---|---|
 | P3-1 | Config Builder | `internal/configbuilder/builder.go`，三层 merge 生成 ONLYOFFICE config | P1-4 |
 | P3-2 | 编辑器 HTML 页面 | `GET /edit?token=`，嵌入 ONLYOFFICE api.js + postMessage | P2-1, P3-1 |
-| P3-3 | Webhook 发送器 | `internal/webhook/webhook.go`，多次重试 + HMAC 签名 | P2-4 |
-| P3-4 | 编辑器 JWT 端点 | 接受 `editor_jwt` → 验证 → 返回编辑器页面 HTML | P3-2 |
+| P3-3 | Webhook 发送器 | `internal/handler/callback.go`，多次重试 + HMAC 签名 | P2-4 |
+| P3-4 | 编辑器 JWT 页面 | `GET /edit?token=` 验证 token → 返回编辑器页面 HTML | P3-2 |
 
 ### 阶段四：前端 SDK + 集成测试（2 天）
 
@@ -604,8 +604,10 @@ onlyoffice-gateway/
 ├── cmd/gateway/
 │   └── main.go                 # 入口：加载配置 → 启动 HTTP server
 ├── internal/
+│   ├── admin/
+│   │   └── handler.go          # Admin 登录 + Service CRUD + services.json 持久化
 │   ├── config/
-│   │   └── config.go           # 配置加载 + 公钥解析 + 域名白名单校验
+│   │   └── config.go           # 配置加载（环境变量 + 可选 YAML）
 │   ├── jwt/
 │   │   └── jwt.go              # RS256 验签 + HS256 签名
 │   ├── storage/
@@ -613,24 +615,26 @@ onlyoffice-gateway/
 │   │   └── local.go            # 本地磁盘实现
 │   ├── configbuilder/
 │   │   └── builder.go          # ONLYOFFICE config 分层 merge
-│   ├── webhook/
-│   │   └── webhook.go          # Webhook 发送 + 指数退避重试
+│   ├── gateway/
+│   │   ├── server.go           # HTTP router + ServiceResolver 边界
+│   │   └── middleware.go       # 统一访问日志
 │   └── handler/
 │       ├── upload.go           # POST /api/v1/documents
 │       ├── download.go         # GET /api/v1/documents/{id}
 │       ├── callback.go         # POST /callback (ONLYOFFICE)
 │       ├── editor.go           # GET /edit?token= (编辑器页面)
-│       └── health.go           # GET /api/v1/health
-├── static/
-│   └── editor.html             # 编辑器 HTML 模板 (Go embed)
+│       └── helpers.go          # JSON 响应等 handler helper
+├── admin-ui/
+│   └── src/                    # 管理端 SPA
 ├── frontend-sdk/
 │   ├── package.json
 │   └── src/
 │       ├── OnlyOfficeEditor.tsx # React 组件
-│       └── postMessage.ts      # postMessage 协议封装
-├── gateway.yaml.example        # 配置模板
+│       └── index.ts            # SDK 导出
+├── .env.example                # 环境变量模板
 ├── Makefile
 ├── Dockerfile
+├── docker-compose.yml
 ├── go.mod
 └── go.sum
 ```
@@ -685,19 +689,25 @@ WORKDIR /app
 COPY --from=builder /app/gateway .
 VOLUME /app/data
 EXPOSE 18080
-ENTRYPOINT ["./gateway", "-config", "/app/gateway.yaml"]
+ENTRYPOINT ["./gateway"]
 ```
 
 ```yaml
-# docker-compose.yml
-version: "3.8"
 services:
-  onlyoffice-gateway:
+  document-server:
+    image: onlyoffice/documentserver:latest
+
+  gateway:
     build: .
     ports:
       - "18080:18080"
+    environment:
+      DOCUMENT_SERVER_URL: http://document-server
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SERVICE_STORE_PATH: /app/data/services.json
     volumes:
-      - ./gateway.yaml:/app/gateway.yaml:ro
       - gateway-data:/app/data
     restart: unless-stopped
 

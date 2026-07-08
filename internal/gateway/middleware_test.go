@@ -100,3 +100,62 @@ func TestLoggingMiddlewareIncludesDuration(t *testing.T) {
 		t.Fatalf("expected log to contain duration unit (µs/ms/s), got: %s", output)
 	}
 }
+
+func TestLoggingMiddlewareLogsFirstStatusCode(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(log.Writer()) })
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	wrapped := gateway.LoggingMiddleware(inner)
+	server := httptest.NewServer(wrapped)
+	t.Cleanup(server.Close)
+
+	resp, err := http.Post(server.URL+"/api/v1/documents", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	output := buf.String()
+	if !strings.Contains(output, "201") {
+		t.Fatalf("expected log to contain first status 201, got: %s", output)
+	}
+	if strings.Contains(output, "500") {
+		t.Fatalf("expected log not to be overwritten by second status, got: %s", output)
+	}
+}
+
+func TestLoggingMiddlewareIncludesRequestContext(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(log.Writer()) })
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	wrapped := gateway.LoggingMiddleware(inner)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	req.RemoteAddr = "203.0.113.10:54321"
+	req.Header.Set("User-Agent", "gateway-test/1.0")
+	req.Header.Set("X-Request-Id", "req-123")
+	rec := httptest.NewRecorder()
+
+	wrapped.ServeHTTP(rec, req)
+
+	output := buf.String()
+	for _, want := range []string{
+		"remote_addr=203.0.113.10:54321",
+		`user_agent="gateway-test/1.0"`,
+		"request_id=req-123",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected log to contain %q, got: %s", want, output)
+		}
+	}
+}

@@ -40,8 +40,6 @@ func main() {
 		log.Fatalf("load service store: %v", err)
 	}
 
-	gwHandler := gateway.NewHandler(cfg, serviceStore)
-
 	adminUser := os.Getenv("ADMIN_USERNAME")
 	if adminUser == "" {
 		adminUser = "admin"
@@ -52,6 +50,16 @@ func main() {
 		log.Println("  Create a .env file:  cp .env.example .env  →  edit ADMIN_PASSWORD")
 	}
 
+	handler := newRootHandler(cfg, serviceStore, adminUser, adminPass)
+
+	log.Printf("Gateway %s listening on %s", version.Version, cfg.ListenAddr)
+	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+func newRootHandler(cfg *config.Config, serviceStore *admin.InMemoryServiceStore, adminUser, adminPass string) http.Handler {
+	gwHandler := gateway.NewHandler(cfg, serviceStore)
 	adminMux := admin.NewMux(admin.Opts{
 		AdminUsername: adminUser,
 		AdminPassword: adminPass,
@@ -63,10 +71,7 @@ func main() {
 	mux.Handle("/admin/api/", adminMux)
 	mux.Handle("/", gwHandler)
 
-	log.Printf("Gateway %s listening on %s", version.Version, cfg.ListenAddr)
-	if err := http.ListenAndServe(cfg.ListenAddr, mux); err != nil {
-		log.Fatalf("server error: %v", err)
-	}
+	return gateway.LoggingMiddleware(mux)
 }
 
 func loadDotEnv(path string) {
