@@ -796,6 +796,135 @@ func TestEditIncludesSignedOnlyOfficeConfigToken(t *testing.T) {
 	}
 }
 
+func TestEditUsesPublicDocumentServerURLForBrowserScript(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		ListenAddr:              "127.0.0.1:18080",
+		DocumentServerURL:       "http://document-server",
+		DocumentServerPublicURL: "https://office.example.com",
+		JWTSecret:               "test-gateway-jwt-secret",
+		StorageDir:              filepath.Join(tmpDir, "storage"),
+		TTLHours:                8,
+		WebhookMaxRetries:       3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	handler := gateway.NewHandler(loaded, store)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id":  "test-service",
+		"document_id": docID,
+		"exp":         time.Now().Add(30 * time.Minute).Unix(),
+		"iat":         time.Now().Unix(),
+	})
+
+	req, _ := http.NewRequest("GET", server.URL+"/edit?token="+editToken, nil)
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	html, _ := io.ReadAll(resp.Body)
+	htmlStr := string(html)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, truncate(htmlStr, 200))
+	}
+	if !contains(htmlStr, `<script src="https://office.example.com/web-apps/apps/api/documents/api.js"></script>`) {
+		t.Fatalf("expected public document server script URL, got: %s", truncate(htmlStr, 800))
+	}
+	if contains(htmlStr, `<script src="http://document-server/`) {
+		t.Fatalf("expected no internal document server script URL, got: %s", truncate(htmlStr, 800))
+	}
+}
+
+func TestEditDefaultsBrowserScriptToForwardedGatewayURL(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id":  "test-service",
+		"document_id": docID,
+		"exp":         time.Now().Add(30 * time.Minute).Unix(),
+		"iat":         time.Now().Unix(),
+	})
+
+	req, _ := http.NewRequest("GET", server.URL+"/edit?token="+editToken, nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "doc-gateway.codeshell.cc")
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	html, _ := io.ReadAll(resp.Body)
+	htmlStr := string(html)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, truncate(htmlStr, 200))
+	}
+	if !contains(htmlStr, `<script src="https://doc-gateway.codeshell.cc/web-apps/apps/api/documents/api.js"></script>`) {
+		t.Fatalf("expected forwarded gateway script URL, got: %s", truncate(htmlStr, 800))
+	}
+	if contains(htmlStr, `<script src="http://document-server/`) {
+		t.Fatalf("expected no internal document server script URL, got: %s", truncate(htmlStr, 800))
+	}
+}
+
+func TestGatewayProxiesDocumentServerWebAssets(t *testing.T) {
+	_, pubPEM := generateRSAKeyPair(t)
+	var proxiedPath string
+	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxiedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte("window.DocsAPI = {};"))
+	}))
+	defer documentServer.Close()
+
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: documentServer.URL,
+		JWTSecret:         "test-gateway-jwt-secret",
+		StorageDir:        filepath.Join(t.TempDir(), "storage"),
+		TTLHours:          8,
+		WebhookMaxRetries: 3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	server := httptest.NewServer(gateway.NewHandler(loaded, store))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/web-apps/apps/api/documents/api.js")
+	if err != nil {
+		t.Fatalf("request proxied asset: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from proxied document server asset, got %d", resp.StatusCode)
+	}
+	if proxiedPath != "/web-apps/apps/api/documents/api.js" {
+		t.Fatalf("expected proxied path, got %q", proxiedPath)
+	}
+	if string(body) != "window.DocsAPI = {};" {
+		t.Fatalf("expected proxied body, got %q", string(body))
+	}
+}
+
 func signJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) string {
 	t.Helper()
 	block, _ := pem.Decode([]byte(privateKeyPEM))

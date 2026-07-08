@@ -5,17 +5,19 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	ListenAddr        string `yaml:"listen_addr"`
-	DocumentServerURL string `yaml:"document_server_url"`
-	JWTSecret         string `yaml:"jwt_secret"`
-	StorageDir        string `yaml:"storage_dir"`
-	TTLHours          int    `yaml:"ttl_hours"`
-	WebhookMaxRetries int    `yaml:"webhook_max_retries"`
+	ListenAddr              string `yaml:"listen_addr"`
+	DocumentServerURL       string `yaml:"document_server_url"`
+	DocumentServerPublicURL string `yaml:"document_server_public_url"`
+	JWTSecret               string `yaml:"jwt_secret"`
+	StorageDir              string `yaml:"storage_dir"`
+	TTLHours                int    `yaml:"ttl_hours"`
+	WebhookMaxRetries       int    `yaml:"webhook_max_retries"`
 }
 
 func Defaults() *Config {
@@ -55,6 +57,9 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 	if s := os.Getenv("DOCUMENT_SERVER_URL"); s != "" {
 		cfg.DocumentServerURL = s
 	}
+	if s := os.Getenv("DOCUMENT_SERVER_PUBLIC_URL"); s != "" {
+		cfg.DocumentServerPublicURL = s
+	}
 	if s := os.Getenv("STORAGE_DIR"); s != "" {
 		cfg.StorageDir = s
 	}
@@ -74,6 +79,8 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage dir: %w", err)
 	}
+	cfg.DocumentServerURL = strings.TrimRight(cfg.DocumentServerURL, "/")
+	cfg.DocumentServerPublicURL = strings.TrimRight(cfg.DocumentServerPublicURL, "/")
 	return cfg, nil
 }
 

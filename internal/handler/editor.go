@@ -91,6 +91,10 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 
 	configJSON := builder.Build()
+	documentServerBrowserURL := h.cfg.DocumentServerPublicURL
+	if documentServerBrowserURL == "" {
+		documentServerBrowserURL = h.serverURL
+	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -124,7 +128,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 </body>
 </html>`,
 		meta.FileName,
-		h.cfg.DocumentServerURL,
+		documentServerBrowserURL,
 		string(configJSON),
 	)
 

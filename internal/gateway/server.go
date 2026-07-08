@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -80,7 +82,33 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	registerDocumentServerProxy(mux, cfg.DocumentServerURL)
+
 	return mux
+}
+
+func registerDocumentServerProxy(mux *http.ServeMux, documentServerURL string) {
+	documentServerURL = strings.TrimSpace(documentServerURL)
+	if documentServerURL == "" {
+		return
+	}
+	target, err := url.Parse(documentServerURL)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		return
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	prefixes := []string{
+		"/web-apps/",
+		"/sdkjs/",
+		"/coauthoring/",
+		"/spellchecker/",
+		"/cache/",
+		"/doc/",
+		"/healthcheck",
+	}
+	for _, prefix := range prefixes {
+		mux.Handle(prefix, proxy)
+	}
 }
 
 func getServerURL(r *http.Request) string {
