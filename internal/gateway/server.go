@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
 	"github.com/zenmind/onlyoffice-gateway/internal/handler"
 	"github.com/zenmind/onlyoffice-gateway/internal/storage"
 )
+
+var documentServerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // ServiceResolver provides access to registered services and their public keys.
 type ServiceResolver interface {
@@ -52,7 +55,13 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 	mux.HandleFunc("GET /api/v1/health/ds", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		dsURL := cfg.DocumentServerURL + "/healthcheck"
-		resp, err := http.Get(dsURL)
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, dsURL, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, `{"document_server_ok":false,"document_server_url":"%s"}`, cfg.DocumentServerURL)
+			return
+		}
+		resp, err := documentServerHTTPClient.Do(req)
 		ok := err == nil && resp != nil && resp.StatusCode == http.StatusOK
 		if resp != nil {
 			resp.Body.Close()

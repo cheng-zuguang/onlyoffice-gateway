@@ -14,6 +14,8 @@ import (
 	"github.com/zenmind/onlyoffice-gateway/internal/storage"
 )
 
+var callbackHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 type CallbackBody struct {
 	Key           string   `json:"key"`
 	Status        int      `json:"status"`
@@ -80,7 +82,7 @@ func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CallbackHandler) processSaving(body CallbackBody) {
-	resp, err := http.Get(body.URL)
+	resp, err := callbackHTTPClient.Get(body.URL)
 	if err != nil {
 		log.Printf("[callback] download edited file: %v", err)
 		return
@@ -125,7 +127,7 @@ func (h *CallbackHandler) deliverWebhook(documentID string) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Gateway-Signature", "sha256="+sig)
 		req.Header.Set("X-Gateway-Event", "document.saved")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := callbackHTTPClient.Do(req)
 		if err == nil && resp.StatusCode < 400 {
 			resp.Body.Close()
 			log.Printf("[webhook] delivered: doc=%s attempt=%d", documentID, attempt)

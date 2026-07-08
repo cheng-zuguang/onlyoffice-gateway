@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/admin"
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
@@ -53,7 +54,15 @@ func main() {
 	handler := newRootHandler(cfg, serviceStore, adminUser, adminPass)
 
 	log.Printf("Gateway %s listening on %s", version.Version, cfg.ListenAddr)
-	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {
+	server := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
