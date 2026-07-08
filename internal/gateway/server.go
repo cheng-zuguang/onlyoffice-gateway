@@ -97,6 +97,13 @@ func registerDocumentServerProxy(mux *http.ServeMux, documentServerURL string) {
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	versionedProxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isDocumentServerVersionedAssetPath(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
 	prefixes := []string{
 		"/web-apps/",
 		"/sdkjs/",
@@ -109,6 +116,26 @@ func registerDocumentServerProxy(mux *http.ServeMux, documentServerURL string) {
 	for _, prefix := range prefixes {
 		mux.Handle(prefix, proxy)
 	}
+	mux.Handle("/", versionedProxy)
+}
+
+func isDocumentServerVersionedAssetPath(path string) bool {
+	path = strings.TrimPrefix(path, "/")
+	segment, _, ok := strings.Cut(path, "/")
+	if !ok || segment == "" {
+		return false
+	}
+	hasDigit := false
+	for _, r := range segment {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r == '.' || r == '-':
+		default:
+			return false
+		}
+	}
+	return hasDigit
 }
 
 func getServerURL(r *http.Request) string {

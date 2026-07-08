@@ -925,6 +925,97 @@ func TestGatewayProxiesDocumentServerWebAssets(t *testing.T) {
 	}
 }
 
+func TestGatewayProxiesVersionedDocumentServerWebAssets(t *testing.T) {
+	_, pubPEM := generateRSAKeyPair(t)
+	var proxiedPath string
+	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxiedPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html>document editor</html>"))
+	}))
+	defer documentServer.Close()
+
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: documentServer.URL,
+		JWTSecret:         "test-gateway-jwt-secret",
+		StorageDir:        filepath.Join(t.TempDir(), "storage"),
+		TTLHours:          8,
+		WebhookMaxRetries: 3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	server := httptest.NewServer(gateway.NewHandler(loaded, store))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/6.4.2-6/web-apps/apps/documenteditor/main/index.html?_dc=6.4.2-6")
+	if err != nil {
+		t.Fatalf("request proxied versioned asset: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from proxied versioned document server asset, got %d", resp.StatusCode)
+	}
+	if proxiedPath != "/6.4.2-6/web-apps/apps/documenteditor/main/index.html" {
+		t.Fatalf("expected proxied versioned path, got %q", proxiedPath)
+	}
+	if string(body) != "<html>document editor</html>" {
+		t.Fatalf("expected proxied body, got %q", string(body))
+	}
+}
+
+func TestGatewayDoesNotProxyNonVersionedUnknownRootPaths(t *testing.T) {
+	_, pubPEM := generateRSAKeyPair(t)
+	proxyHit := false
+	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer documentServer.Close()
+
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: documentServer.URL,
+		JWTSecret:         "test-gateway-jwt-secret",
+		StorageDir:        filepath.Join(t.TempDir(), "storage"),
+		TTLHours:          8,
+		WebhookMaxRetries: 3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	server := httptest.NewServer(gateway.NewHandler(loaded, store))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/not-a-document-server-path")
+	if err != nil {
+		t.Fatalf("request unknown root path: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown root path, got %d", resp.StatusCode)
+	}
+	if proxyHit {
+		t.Fatal("expected unknown root path not to be proxied to document server")
+	}
+}
+
 func signJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) string {
 	t.Helper()
 	block, _ := pem.Decode([]byte(privateKeyPEM))
