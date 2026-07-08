@@ -704,6 +704,36 @@ func TestEditAcceptsValidToken(t *testing.T) {
 	}
 }
 
+func TestEditViewModeRendersReadonlyConfig(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id":  "test-service",
+		"document_id": docID,
+		"exp":         time.Now().Add(30 * time.Minute).Unix(),
+		"iat":         time.Now().Unix(),
+	})
+
+	req, _ := http.NewRequest("GET", server.URL+"/edit?token="+editToken+"&mode=view", nil)
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	html, _ := io.ReadAll(resp.Body)
+	htmlStr := string(html)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, truncate(htmlStr, 200))
+	}
+	if !contains(htmlStr, `"mode":"view"`) {
+		t.Fatalf("expected editor config to include view mode, got: %s", truncate(htmlStr, 400))
+	}
+	if !contains(htmlStr, `"permissions":{"download":true,"edit":false}`) {
+		t.Fatalf("expected editor config to disable editing, got: %s", truncate(htmlStr, 600))
+	}
+}
+
 func signJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) string {
 	t.Helper()
 	block, _ := pem.Decode([]byte(privateKeyPEM))

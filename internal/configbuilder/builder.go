@@ -18,6 +18,7 @@ type Params struct {
 	Key               string
 	Title             string
 	DocumentType      string
+	Mode              string
 	User              map[string]interface{}
 	Branding          *Branding
 	ConfigOverrides   map[string]interface{}
@@ -69,6 +70,18 @@ func (b *Builder) Build() json.RawMessage {
 	// Layer 3: Config overrides (deep merge, wins over layer 1+2)
 	if b.params.ConfigOverrides != nil {
 		deepMerge(cfg, b.params.ConfigOverrides)
+	}
+
+	if b.params.Mode == "view" {
+		cfg["mode"] = "view"
+		doc := cfg["document"].(map[string]interface{})
+		permissions, _ := doc["permissions"].(map[string]interface{})
+		if permissions == nil {
+			permissions = map[string]interface{}{}
+			doc["permissions"] = permissions
+		}
+		permissions["edit"] = false
+		permissions["download"] = true
 	}
 
 	data, _ := json.Marshal(cfg)

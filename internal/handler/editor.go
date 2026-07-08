@@ -23,6 +23,10 @@ func NewEditorHandler(cfg *config.Config, resolver gwjwt.ServiceResolver, store 
 
 func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tokenStr := r.URL.Query().Get("token")
+	mode := r.URL.Query().Get("mode")
+	if mode != "view" {
+		mode = ""
+	}
 
 	if tokenStr == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing token"})
@@ -76,6 +80,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Key:               meta.EditorKey,
 		Title:             meta.FileName,
 		DocumentType:      meta.DocumentType,
+		Mode:              mode,
 		Branding:          branding,
 		ConfigOverrides:   overrides,
 		User: map[string]interface{}{

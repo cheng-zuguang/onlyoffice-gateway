@@ -132,3 +132,30 @@ func TestBuilderOverridesWithConfigOverrides(t *testing.T) {
 		t.Fatalf("expected comment: false from override")
 	}
 }
+
+func TestBuilderViewModeDisablesEditing(t *testing.T) {
+	builder := configbuilder.New(configbuilder.Params{
+		DocumentServerURL: "https://doc.example.com",
+		CallbackURL:       "https://gateway.example.com/callback",
+		DownloadURL:       "https://gateway.example.com/download/doc-123",
+		FileType:          "docx",
+		Key:               "key-view",
+		Title:             "readonly.docx",
+		DocumentType:      "word",
+		Mode:              "view",
+	})
+
+	result := builder.Build()
+	m := unmarshal(result)
+
+	if m["mode"] != "view" {
+		t.Fatalf("expected top-level mode view, got %v", m["mode"])
+	}
+	permissions := m["document"].(map[string]interface{})["permissions"].(map[string]interface{})
+	if permissions["edit"] != false {
+		t.Fatalf("expected edit permission false in view mode, got %v", permissions["edit"])
+	}
+	if permissions["download"] != true {
+		t.Fatalf("expected download permission true in view mode, got %v", permissions["download"])
+	}
+}
