@@ -77,4 +77,4 @@ export type { SavedEvent, ErrorEvent, OnlyOfficeEditorProps };
 
 export type OnlyOfficeEditorMode = "edit" | "view";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
