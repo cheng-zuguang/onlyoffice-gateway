@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/zenmind/onlyoffice-gateway/internal/configbuilder"
 )
 
@@ -157,5 +158,41 @@ func TestBuilderViewModeDisablesEditing(t *testing.T) {
 	}
 	if permissions["download"] != true {
 		t.Fatalf("expected download permission true in view mode, got %v", permissions["download"])
+	}
+}
+
+func TestBuilderSignsConfigWhenJWTSecretProvided(t *testing.T) {
+	builder := configbuilder.New(configbuilder.Params{
+		DocumentServerURL: "https://doc.example.com",
+		CallbackURL:       "https://gateway.example.com/callback",
+		DownloadURL:       "https://gateway.example.com/download/doc-123",
+		FileType:          "docx",
+		Key:               "key-signed",
+		Title:             "signed.docx",
+		DocumentType:      "word",
+		JWTSecret:         "shared-secret",
+	})
+
+	result := builder.Build()
+	m := unmarshal(result)
+	tokenString, ok := m["token"].(string)
+	if !ok || tokenString == "" {
+		t.Fatal("expected signed ONLYOFFICE config token")
+	}
+
+	token, err := jwt.Parse(tokenString, func(parsed *jwt.Token) (interface{}, error) {
+		if parsed.Method != jwt.SigningMethodHS256 {
+			t.Fatalf("expected HS256 token, got %v", parsed.Header["alg"])
+		}
+		return []byte("shared-secret"), nil
+	})
+	if err != nil || !token.Valid {
+		t.Fatalf("expected valid config token, got token=%v err=%v", token.Valid, err)
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	document := claims["document"].(map[string]interface{})
+	if document["url"] != "https://gateway.example.com/download/doc-123" {
+		t.Fatalf("expected document url in signed token, got %v", document["url"])
 	}
 }

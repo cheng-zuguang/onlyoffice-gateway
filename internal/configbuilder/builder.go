@@ -1,6 +1,10 @@
 package configbuilder
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/golang-jwt/jwt/v5"
+)
 
 // Branding defines limited customization options for the editor.
 type Branding struct {
@@ -22,6 +26,7 @@ type Params struct {
 	User              map[string]interface{}
 	Branding          *Branding
 	ConfigOverrides   map[string]interface{}
+	JWTSecret         string
 }
 
 // Config is the output ONLYOFFICE configuration.
@@ -82,6 +87,13 @@ func (b *Builder) Build() json.RawMessage {
 		}
 		permissions["edit"] = false
 		permissions["download"] = true
+	}
+
+	if b.params.JWTSecret != "" {
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(cfg))
+		if signed, err := token.SignedString([]byte(b.params.JWTSecret)); err == nil {
+			cfg["token"] = signed
+		}
 	}
 
 	data, _ := json.Marshal(cfg)

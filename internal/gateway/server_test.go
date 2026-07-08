@@ -734,6 +734,68 @@ func TestEditViewModeRendersReadonlyConfig(t *testing.T) {
 	}
 }
 
+func TestEditUsesForwardedPublicURLForDocumentServerCallbacks(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id":  "test-service",
+		"document_id": docID,
+		"exp":         time.Now().Add(30 * time.Minute).Unix(),
+		"iat":         time.Now().Unix(),
+	})
+
+	req, _ := http.NewRequest("GET", server.URL+"/edit?token="+editToken, nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "doc-gateway.codeshell.cc")
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	html, _ := io.ReadAll(resp.Body)
+	htmlStr := string(html)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, truncate(htmlStr, 200))
+	}
+	if !contains(htmlStr, `"url":"https://doc-gateway.codeshell.cc/download/`+docID+`"`) {
+		t.Fatalf("expected forwarded https download url, got: %s", truncate(htmlStr, 800))
+	}
+	if !contains(htmlStr, `"callbackUrl":"https://doc-gateway.codeshell.cc/callback"`) {
+		t.Fatalf("expected forwarded https callback url, got: %s", truncate(htmlStr, 800))
+	}
+	if contains(htmlStr, `http://doc-gateway.codeshell.cc/download/`) {
+		t.Fatalf("expected no downgraded http download url, got: %s", truncate(htmlStr, 800))
+	}
+}
+
+func TestEditIncludesSignedOnlyOfficeConfigToken(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id":  "test-service",
+		"document_id": docID,
+		"exp":         time.Now().Add(30 * time.Minute).Unix(),
+		"iat":         time.Now().Unix(),
+	})
+
+	req, _ := http.NewRequest("GET", server.URL+"/edit?token="+editToken, nil)
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+
+	html, _ := io.ReadAll(resp.Body)
+	htmlStr := string(html)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, truncate(htmlStr, 200))
+	}
+	if !contains(htmlStr, `"token":"`) {
+		t.Fatalf("expected signed ONLYOFFICE config token in editor HTML, got: %s", truncate(htmlStr, 800))
+	}
+}
+
 func signJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) string {
 	t.Helper()
 	block, _ := pem.Decode([]byte(privateKeyPEM))

@@ -87,6 +87,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"id":   "gateway-user",
 			"name": "User",
 		},
+		JWTSecret: h.cfg.JWTSecret,
 	})
 
 	configJSON := builder.Build()
