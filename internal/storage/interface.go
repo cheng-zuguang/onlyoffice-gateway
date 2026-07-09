@@ -25,6 +25,7 @@ type Meta struct {
 type Store interface {
 	Put(documentID string, reader io.Reader, meta Meta) error
 	Get(documentID string) (io.ReadCloser, error)
+	GetOriginal(documentID string) (io.ReadSeekCloser, *Meta, error)
 	PutEdited(documentID string, reader io.Reader) error
 	GetMeta(documentID string) (*Meta, error)
 	MarkEdited(documentID string) error

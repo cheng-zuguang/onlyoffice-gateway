@@ -157,6 +157,8 @@ import { OnlyOfficeEditor } from "@zenmind/onlyoffice-editor";
 | `GET` | `/download/{docId}` | Document Server 下载原始文件 |
 | `POST` | `/callback` | Document Server 回调 |
 
+`/download/{docId}` 始终返回上传时的原始文件，不会因后续编辑结果覆盖而改变。Gateway 使用标准文件响应能力返回 `Content-Length`、`ETag`、`Last-Modified`、`Accept-Ranges`，并设置 `Cache-Control: private, max-age=28800`，便于 Document Server 更快获取和复用同一编辑会话的原文件。
+
 ### Admin API（管理端）
 
 | 方法 | 路径 | 认证 | 说明 |
@@ -211,6 +213,14 @@ X-Gateway-Signature: sha256=<HMAC(url+body, jwt_secret)>
 ```
 
 Gateway 对 Webhook 做有限重试（3 次，指数退避），失败后静默。
+
+保存回调中，Gateway 会从 Document Server 回调体的 `url` 下载编辑后文件并保存为最新版。该下载和 Webhook 投递共用带连接池的 HTTP client，支持 keep-alive 和连接复用，降低高并发保存时的连接建立开销。
+
+## 性能与缓存
+
+- Document Server 前端资源代理会为 `/web-apps/`、`/sdkjs/`、`/spellchecker/`、`/cache/` 等静态资源设置缓存头；版本化资源使用 `public, max-age=31536000, immutable`。
+- `/download/{docId}` 面向 Document Server 返回原始文件，支持 Range 请求和条件请求，业务侧 `/api/v1/documents/{id}` 仍返回编辑完成后的最新版。
+- 本地 storage 采用按文档 ID 的锁粒度，不同文档的上传、读取、保存不会被单个文档的大文件写入全局阻塞。
 
 ## 部署
 

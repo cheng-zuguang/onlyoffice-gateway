@@ -297,7 +297,10 @@ Gateway → 返回编辑后的文件二进制
 
 ONLYOFFICE Document Server 下载原文件。此路由不在公开 API 中，仅供 Document Server 调用。
 
-- Gateway 从 storage 读取原始文件返回
+- Gateway 从 storage 读取上传时的原始文件返回；业务下载接口仍读取最新版（优先 edited）
+- 响应包含 `Content-Length`、`ETag`、`Last-Modified`、`Accept-Ranges`
+- 使用 `Cache-Control: private, max-age=28800`，便于 Document Server 在同一编辑窗口内复用原文件
+- 使用标准文件响应，支持 Range 与条件请求
 - 仅允许来自 `document_server_url` 的请求（TODO: IP filter）
 
 #### `POST /callback`
@@ -318,10 +321,12 @@ ONLYOFFICE Document Server 回调，携带编辑结果。
 ```
 
 Gateway 处理逻辑：
-1. `status === 2` 或 `status === 6` → 从 `url` 下载编辑后文件 → 替换 storage → 触发 webhook
+1. `status === 2` 或 `status === 6` → debounce 合并 → 从 `url` 下载编辑后文件 → 保存为最新版 → 触发 webhook
 2. `status === 1` → 用户连接/断开通知
 3. `status === 4` → 文档关闭无变更
 4. `status === 3` 或 `7` → 保存错误
+
+回调下载和 Webhook 投递使用带连接池的 HTTP client，配置 keep-alive、空闲连接池、TLS 握手超时与响应头超时，减少高并发保存时的连接建立成本。
 
 ### 4.3 编辑器配置分层 merge
 
@@ -436,6 +441,12 @@ verify(expected == actual)
     original.docx   → 原始文件
     edited.docx     → 编辑后文件（存在 = 已编辑）
 ```
+
+读取语义：
+
+- `GetOriginal`：供 `/download/{docId}` 使用，只返回上传原件，保证 Document Server 编辑会话稳定。
+- `Get`：供业务下载使用，优先返回 `edited.docx`，没有编辑结果时回退 `original.docx`。
+- 本地存储按 document ID 加锁，同一文档内读写串行保护，不同文档之间可并发处理，避免大文件保存阻塞其他文档读取。
 
 **meta.json 结构**:
 

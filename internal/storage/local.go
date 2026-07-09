@@ -11,20 +11,22 @@ import (
 )
 
 type LocalStore struct {
-	root string
-	mu   sync.RWMutex
+	root    string
+	mu      sync.Mutex
+	docLock map[string]*sync.RWMutex
 }
 
 func NewLocalStore(root string) (*LocalStore, error) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return nil, fmt.Errorf("create storage root: %w", err)
 	}
-	return &LocalStore{root: root}, nil
+	return &LocalStore{root: root, docLock: make(map[string]*sync.RWMutex)}, nil
 }
 
 func (s *LocalStore) Put(documentID string, reader io.Reader, meta Meta) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	lock := s.lockFor(documentID)
+	lock.Lock()
+	defer lock.Unlock()
 	dir := filepath.Join(s.root, documentID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create doc dir: %w", err)
@@ -45,8 +47,9 @@ func (s *LocalStore) Put(documentID string, reader io.Reader, meta Meta) error {
 }
 
 func (s *LocalStore) Get(documentID string) (io.ReadCloser, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	lock := s.lockFor(documentID)
+	lock.RLock()
+	defer lock.RUnlock()
 	dir := filepath.Join(s.root, documentID)
 	for _, name := range []string{"edited.docx", "original.docx"} {
 		p := filepath.Join(dir, name)
@@ -57,9 +60,25 @@ func (s *LocalStore) Get(documentID string) (io.ReadCloser, error) {
 	return nil, os.ErrNotExist
 }
 
+func (s *LocalStore) GetOriginal(documentID string) (io.ReadSeekCloser, *Meta, error) {
+	lock := s.lockFor(documentID)
+	lock.RLock()
+	defer lock.RUnlock()
+	meta, err := s.readMetaLocked(documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	f, err := os.Open(filepath.Join(s.root, documentID, "original.docx"))
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, meta, nil
+}
+
 func (s *LocalStore) PutEdited(documentID string, reader io.Reader) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	lock := s.lockFor(documentID)
+	lock.Lock()
+	defer lock.Unlock()
 	dir := filepath.Join(s.root, documentID)
 	f, err := os.Create(filepath.Join(dir, "edited.docx"))
 	if err != nil {
@@ -73,14 +92,16 @@ func (s *LocalStore) PutEdited(documentID string, reader io.Reader) error {
 }
 
 func (s *LocalStore) GetMeta(documentID string) (*Meta, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	lock := s.lockFor(documentID)
+	lock.RLock()
+	defer lock.RUnlock()
 	return s.readMetaLocked(documentID)
 }
 
 func (s *LocalStore) MarkEdited(documentID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	lock := s.lockFor(documentID)
+	lock.Lock()
+	defer lock.Unlock()
 	meta, err := s.readMetaLocked(documentID)
 	if err != nil {
 		return err
@@ -91,8 +112,9 @@ func (s *LocalStore) MarkEdited(documentID string) error {
 }
 
 func (s *LocalStore) ExtendTTL(documentID string, hours int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	lock := s.lockFor(documentID)
+	lock.Lock()
+	defer lock.Unlock()
 	meta, err := s.readMetaLocked(documentID)
 	if err != nil {
 		return err
@@ -102,14 +124,13 @@ func (s *LocalStore) ExtendTTL(documentID string, hours int) error {
 }
 
 func (s *LocalStore) Delete(documentID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	lock := s.lockFor(documentID)
+	lock.Lock()
+	defer lock.Unlock()
 	return os.RemoveAll(filepath.Join(s.root, documentID))
 }
 
 func (s *LocalStore) Expire() (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return 0, err
@@ -120,8 +141,11 @@ func (s *LocalStore) Expire() (int, error) {
 		if !e.IsDir() {
 			continue
 		}
+		lock := s.lockFor(e.Name())
+		lock.Lock()
 		meta, err := s.readMetaLocked(e.Name())
 		if err != nil {
+			lock.Unlock()
 			continue
 		}
 		if meta.ExpiresAt.Before(now) {
@@ -129,6 +153,7 @@ func (s *LocalStore) Expire() (int, error) {
 				cleaned++
 			}
 		}
+		lock.Unlock()
 	}
 	return cleaned, nil
 }
@@ -149,4 +174,15 @@ func (s *LocalStore) readMetaLocked(documentID string) (*Meta, error) {
 func (s *LocalStore) writeMetaLocked(documentID string, meta *Meta) error {
 	data, _ := json.MarshalIndent(meta, "", "  ")
 	return os.WriteFile(filepath.Join(s.root, documentID, "meta.json"), data, 0644)
+}
+
+func (s *LocalStore) lockFor(documentID string) *sync.RWMutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, ok := s.docLock[documentID]
+	if !ok {
+		lock = &sync.RWMutex{}
+		s.docLock[documentID] = lock
+	}
+	return lock
 }

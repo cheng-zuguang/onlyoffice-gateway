@@ -283,6 +283,41 @@ func TestDownloadDocument(t *testing.T) {
 	}
 }
 
+func TestDocumentServerDownloadServesOriginalWithCacheHeaders(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+	markDocumentEdited(t, storageDir, docID, "edited file content")
+
+	resp, err := http.Get(server.URL + "/download/" + docID)
+	if err != nil {
+		t.Fatalf("request document server download: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(body))
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "test-content" {
+		t.Fatalf("expected document server download to serve original content, got %q", string(body))
+	}
+	if got := resp.Header.Get("Content-Length"); got != "12" {
+		t.Fatalf("expected Content-Length 12, got %q", got)
+	}
+	if got := resp.Header.Get("Accept-Ranges"); got != "bytes" {
+		t.Fatalf("expected byte range support, got Accept-Ranges %q", got)
+	}
+	if got := resp.Header.Get("ETag"); got == "" {
+		t.Fatal("expected ETag header")
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "private, max-age=28800" {
+		t.Fatalf("expected document cache header, got %q", got)
+	}
+}
+
 // S6: Download nonexistent document returns 404.
 func TestDownloadReturns404ForMissing(t *testing.T) {
 	_, pubPEM := generateRSAKeyPair(t)
@@ -978,6 +1013,49 @@ func TestGatewayProxiesVersionedDocumentServerWebAssets(t *testing.T) {
 	}
 	if got, want := resp.Header.Get("Cache-Control"), "public, max-age=31536000, immutable"; got != want {
 		t.Fatalf("expected versioned asset cache header %q, got %q", want, got)
+	}
+}
+
+func TestGatewayCachesDocumentServerCacheAssets(t *testing.T) {
+	_, pubPEM := generateRSAKeyPair(t)
+	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte("cached asset"))
+	}))
+	defer documentServer.Close()
+
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: documentServer.URL,
+		JWTSecret:         "test-gateway-jwt-secret",
+		StorageDir:        filepath.Join(t.TempDir(), "storage"),
+		TTLHours:          8,
+		WebhookMaxRetries: 3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	server := httptest.NewServer(gateway.NewHandler(loaded, store))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/cache/files/main.js")
+	if err != nil {
+		t.Fatalf("request cached document server asset: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from proxied cache asset, got %d", resp.StatusCode)
+	}
+	if got, want := resp.Header.Get("Cache-Control"), "public, max-age=86400"; got != want {
+		t.Fatalf("expected cache asset header %q, got %q", want, got)
 	}
 }
 

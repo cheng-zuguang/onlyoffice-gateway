@@ -3,7 +3,6 @@ package gateway
 import (
 	"crypto/rsa"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -45,14 +44,16 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 
 	mux.HandleFunc("GET /download/{docId}", func(w http.ResponseWriter, r *http.Request) {
 		docID := r.PathValue("docId")
-		reader, err := store.Get(docID)
+		reader, meta, err := store.GetOriginal(docID)
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		defer reader.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
-		io.Copy(w, reader)
+		w.Header().Set("Cache-Control", "private, max-age=28800")
+		w.Header().Set("ETag", `"`+meta.EditorKey+`"`)
+		http.ServeContent(w, r, meta.FileName, meta.CreatedAt, reader)
 	})
 
 	mux.HandleFunc("GET /api/v1/health/ds", func(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +146,8 @@ func isDocumentServerStaticAssetPath(path string) bool {
 	switch {
 	case strings.HasPrefix(path, "/web-apps/"),
 		strings.HasPrefix(path, "/sdkjs/"),
-		strings.HasPrefix(path, "/spellchecker/"):
+		strings.HasPrefix(path, "/spellchecker/"),
+		strings.HasPrefix(path, "/cache/"):
 	default:
 		return false
 	}
