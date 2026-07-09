@@ -882,6 +882,7 @@ func TestGatewayProxiesDocumentServerWebAssets(t *testing.T) {
 	var proxiedPath string
 	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxiedPath = r.URL.Path
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "application/javascript")
 		w.Write([]byte("window.DocsAPI = {};"))
 	}))
@@ -923,6 +924,9 @@ func TestGatewayProxiesDocumentServerWebAssets(t *testing.T) {
 	if string(body) != "window.DocsAPI = {};" {
 		t.Fatalf("expected proxied body, got %q", string(body))
 	}
+	if got, want := resp.Header.Get("Cache-Control"), "public, max-age=300, stale-while-revalidate=86400"; got != want {
+		t.Fatalf("expected api.js cache header %q, got %q", want, got)
+	}
 }
 
 func TestGatewayProxiesVersionedDocumentServerWebAssets(t *testing.T) {
@@ -930,6 +934,7 @@ func TestGatewayProxiesVersionedDocumentServerWebAssets(t *testing.T) {
 	var proxiedPath string
 	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxiedPath = r.URL.Path
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte("<html>document editor</html>"))
 	}))
@@ -970,6 +975,9 @@ func TestGatewayProxiesVersionedDocumentServerWebAssets(t *testing.T) {
 	}
 	if string(body) != "<html>document editor</html>" {
 		t.Fatalf("expected proxied body, got %q", string(body))
+	}
+	if got, want := resp.Header.Get("Cache-Control"), "public, max-age=31536000, immutable"; got != want {
+		t.Fatalf("expected versioned asset cache header %q, got %q", want, got)
 	}
 }
 
@@ -1013,6 +1021,45 @@ func TestGatewayDoesNotProxyNonVersionedUnknownRootPaths(t *testing.T) {
 	}
 	if proxyHit {
 		t.Fatal("expected unknown root path not to be proxied to document server")
+	}
+}
+
+func TestGatewayDoesNotOverrideDynamicDocumentServerCacheHeaders(t *testing.T) {
+	_, pubPEM := generateRSAKeyPair(t)
+	documentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write([]byte("dynamic document server response"))
+	}))
+	defer documentServer.Close()
+
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: documentServer.URL,
+		JWTSecret:         "test-gateway-jwt-secret",
+		StorageDir:        filepath.Join(t.TempDir(), "storage"),
+		TTLHours:          8,
+		WebhookMaxRetries: 3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	server := httptest.NewServer(gateway.NewHandler(loaded, store))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/doc/editor")
+	if err != nil {
+		t.Fatalf("request dynamic document server path: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected dynamic cache header to pass through, got %q", got)
 	}
 }
 

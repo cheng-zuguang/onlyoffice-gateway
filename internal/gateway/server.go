@@ -97,6 +97,15 @@ func registerDocumentServerProxy(mux *http.ServeMux, documentServerURL string) {
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.Request == nil || resp.Request.URL == nil {
+			return nil
+		}
+		if cacheControl := documentServerProxyCacheControl(resp.Request.URL.Path); cacheControl != "" {
+			resp.Header.Set("Cache-Control", cacheControl)
+		}
+		return nil
+	}
 	versionedProxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isDocumentServerVersionedAssetPath(r.URL.Path) {
 			http.NotFound(w, r)
@@ -117,6 +126,54 @@ func registerDocumentServerProxy(mux *http.ServeMux, documentServerURL string) {
 		mux.Handle(prefix, proxy)
 	}
 	mux.Handle("/", versionedProxy)
+}
+
+func documentServerProxyCacheControl(path string) string {
+	if isDocumentServerVersionedAssetPath(path) {
+		return "public, max-age=31536000, immutable"
+	}
+	if path == "/web-apps/apps/api/documents/api.js" {
+		return "public, max-age=300, stale-while-revalidate=86400"
+	}
+	if isDocumentServerStaticAssetPath(path) {
+		return "public, max-age=86400"
+	}
+	return ""
+}
+
+func isDocumentServerStaticAssetPath(path string) bool {
+	switch {
+	case strings.HasPrefix(path, "/web-apps/"),
+		strings.HasPrefix(path, "/sdkjs/"),
+		strings.HasPrefix(path, "/spellchecker/"):
+	default:
+		return false
+	}
+
+	lowerPath := strings.ToLower(path)
+	for _, suffix := range []string{
+		".css",
+		".eot",
+		".gif",
+		".html",
+		".ico",
+		".jpg",
+		".jpeg",
+		".js",
+		".json",
+		".map",
+		".png",
+		".svg",
+		".ttf",
+		".wasm",
+		".woff",
+		".woff2",
+	} {
+		if strings.HasSuffix(lowerPath, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isDocumentServerVersionedAssetPath(path string) bool {
