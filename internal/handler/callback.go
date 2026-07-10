@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -83,7 +84,7 @@ func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.debounceMu.Unlock()
 
 	case 1:
-		if err := h.store.ExtendTTL(body.Key, 8); err != nil {
+		if err := h.store.ExtendTTL(r.Context(), body.Key, 8); err != nil {
 			log.Printf("[callback] extend ttl: %v", err)
 		}
 
@@ -105,11 +106,11 @@ func (h *CallbackHandler) processSaving(body CallbackBody) {
 	}
 	defer resp.Body.Close()
 
-	if err := h.store.PutEdited(body.Key, resp.Body); err != nil {
+	if err := h.store.PutEdited(context.Background(), body.Key, resp.Body); err != nil {
 		log.Printf("[callback] store edited file: %v", err)
 		return
 	}
-	if err := h.store.MarkEdited(body.Key); err != nil {
+	if err := h.store.MarkEdited(context.Background(), body.Key); err != nil {
 		log.Printf("[callback] mark edited: %v", err)
 		return
 	}
@@ -119,7 +120,7 @@ func (h *CallbackHandler) processSaving(body CallbackBody) {
 }
 
 func (h *CallbackHandler) deliverWebhook(documentID string) {
-	meta, err := h.store.GetMeta(documentID)
+	meta, err := h.store.GetMeta(context.Background(), documentID)
 	if err != nil || meta.WebhookURL == "" {
 		return
 	}

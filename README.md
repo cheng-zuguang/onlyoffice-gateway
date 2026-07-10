@@ -253,7 +253,16 @@ docker compose up -d
 | `LISTEN_ADDR` | `:18080` | 监听地址 |
 | `DOCUMENT_SERVER_URL` | — | Document Server 地址 |
 | `JWT_SECRET` | — | 与 Document Server 共用 |
+| `STORAGE_BACKEND` | `local` | 文件存储后端：`local` / `s3` |
 | `STORAGE_DIR` | `./data/storage` | 文件存储路径 |
+| `S3_ENDPOINT` | — | S3/MinIO endpoint，MinIO 示例：`http://minio:9000` |
+| `S3_REGION` | `us-east-1` | S3 region |
+| `S3_BUCKET` | — | S3/MinIO bucket（需预先创建） |
+| `S3_ACCESS_KEY` | — | S3/MinIO access key |
+| `S3_SECRET_KEY` | — | S3/MinIO secret key |
+| `S3_USE_PATH_STYLE` | `true` | MinIO 通常需要设为 `true` |
+| `S3_USE_SSL` | `true` | endpoint 未带 scheme 时是否默认使用 HTTPS |
+| `S3_PREFIX` | — | 对象 key 前缀，例如 `documents` |
 | `TTL_HOURS` | `8` | 文档存活时间 |
 | `WEBHOOK_MAX_RETRIES` | `3` | Webhook 最大重试次数 |
 | `ADMIN_USERNAME` | `admin` | 管理端用户名 |
@@ -285,9 +294,19 @@ make frontend-dev     # 启动管理端 dev server
 |---|---|
 | 后端 | Go 1.22+, 标准库 HTTP router |
 | 认证 | JWT RS256（服务自签）+ HMAC（webhook 签名 + admin session） |
-| 存储 | 本地磁盘（接口预留 S3/MinIO） |
+| 存储 | 本地磁盘 / S3-compatible 对象存储（MinIO、AWS S3） |
 | 管理端 | React 18 + Vite + shadcn/ui |
 | SDK | React 18, TypeScript, Vitest + jsdom |
+
+### MinIO 本地开发
+
+默认 `docker compose up -d` 仍使用本地磁盘。需要验证对象存储时：
+
+```bash
+STORAGE_BACKEND=s3 docker compose --profile minio up -d
+```
+
+MinIO console 默认暴露在 `http://localhost:19001`，bucket 默认为 `onlyoffice`，对象前缀默认为 `documents/`。
 
 ### 项目结构
 

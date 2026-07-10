@@ -35,3 +35,47 @@ func TestFromLiteralReadsDocumentServerPublicURLFromEnvironment(t *testing.T) {
 		t.Fatalf("expected env public URL, got %q", cfg.DocumentServerPublicURL)
 	}
 }
+
+func TestFromLiteralDefaultsStorageBackendToLocal(t *testing.T) {
+	cfg, err := config.FromLiteral(&config.Config{
+		DocumentServerURL: "http://document-server",
+		StorageDir:        t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.StorageBackend != "local" {
+		t.Fatalf("expected local storage backend by default, got %q", cfg.StorageBackend)
+	}
+}
+
+func TestFromLiteralReadsS3StorageEnvironment(t *testing.T) {
+	t.Setenv("STORAGE_BACKEND", "s3")
+	t.Setenv("S3_ENDPOINT", "http://minio:9000/")
+	t.Setenv("S3_REGION", "us-west-2")
+	t.Setenv("S3_BUCKET", "onlyoffice")
+	t.Setenv("S3_ACCESS_KEY", "access")
+	t.Setenv("S3_SECRET_KEY", "secret")
+	t.Setenv("S3_USE_PATH_STYLE", "true")
+	t.Setenv("S3_USE_SSL", "false")
+	t.Setenv("S3_PREFIX", "/documents/")
+
+	cfg, err := config.FromLiteral(&config.Config{
+		DocumentServerURL: "http://document-server",
+		StorageDir:        t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.StorageBackend != "s3" || cfg.S3Endpoint != "http://minio:9000" || cfg.S3Region != "us-west-2" || cfg.S3Bucket != "onlyoffice" {
+		t.Fatalf("unexpected s3 config: %+v", cfg)
+	}
+	if !cfg.S3UsePathStyle || cfg.S3UseSSL {
+		t.Fatalf("unexpected s3 bool config: path_style=%v ssl=%v", cfg.S3UsePathStyle, cfg.S3UseSSL)
+	}
+	if cfg.S3Prefix != "documents" {
+		t.Fatalf("expected normalized prefix documents, got %q", cfg.S3Prefix)
+	}
+}

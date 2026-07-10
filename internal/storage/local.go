@@ -1,6 +1,9 @@
 package storage
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,15 +26,18 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	return &LocalStore{root: root, docLock: make(map[string]*sync.RWMutex)}, nil
 }
 
-func (s *LocalStore) Put(documentID string, reader io.Reader, meta Meta) error {
+func (s *LocalStore) Put(ctx context.Context, documentID string, reader io.Reader, meta Meta) error {
 	lock := s.lockFor(documentID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dir := filepath.Join(s.root, documentID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create doc dir: %w", err)
 	}
-	f, err := os.Create(filepath.Join(dir, "original.docx"))
+	f, err := os.Create(filepath.Join(dir, "original"))
 	if err != nil {
 		return fmt.Errorf("create original file: %w", err)
 	}
@@ -46,41 +52,60 @@ func (s *LocalStore) Put(documentID string, reader io.Reader, meta Meta) error {
 	return nil
 }
 
-func (s *LocalStore) Get(documentID string) (io.ReadCloser, error) {
+func (s *LocalStore) Open(ctx context.Context, documentID string, variant Variant, byteRange *ByteRange) (io.ReadCloser, *Meta, *ObjectInfo, error) {
 	lock := s.lockFor(documentID)
 	lock.RLock()
 	defer lock.RUnlock()
-	dir := filepath.Join(s.root, documentID)
-	for _, name := range []string{"edited.docx", "original.docx"} {
-		p := filepath.Join(dir, name)
-		if _, err := os.Stat(p); err == nil {
-			return os.Open(p)
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
 	}
-	return nil, os.ErrNotExist
-}
-
-func (s *LocalStore) GetOriginal(documentID string) (io.ReadSeekCloser, *Meta, error) {
-	lock := s.lockFor(documentID)
-	lock.RLock()
-	defer lock.RUnlock()
 	meta, err := s.readMetaLocked(documentID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	f, err := os.Open(filepath.Join(s.root, documentID, "original.docx"))
+	path, err := s.pathForVariantLocked(documentID, variant)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return f, meta, nil
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if byteRange != nil && (byteRange.Start < 0 || byteRange.End < byteRange.Start || byteRange.Start >= info.Size()) {
+		return nil, nil, nil, ErrInvalidRange
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	objectInfo := &ObjectInfo{
+		Size:         info.Size(),
+		ETag:         localETag(info),
+		LastModified: info.ModTime(),
+		ContentType:  "application/octet-stream",
+	}
+	if byteRange == nil {
+		return f, meta, objectInfo, nil
+	}
+	end := byteRange.End
+	if end >= info.Size() {
+		end = info.Size() - 1
+	}
+	return &sectionReadCloser{
+		SectionReader: io.NewSectionReader(f, byteRange.Start, end-byteRange.Start+1),
+		close:         f.Close,
+	}, meta, objectInfo, nil
 }
 
-func (s *LocalStore) PutEdited(documentID string, reader io.Reader) error {
+func (s *LocalStore) PutEdited(ctx context.Context, documentID string, reader io.Reader) error {
 	lock := s.lockFor(documentID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dir := filepath.Join(s.root, documentID)
-	f, err := os.Create(filepath.Join(dir, "edited.docx"))
+	f, err := os.Create(filepath.Join(dir, "edited"))
 	if err != nil {
 		return fmt.Errorf("create edited file: %w", err)
 	}
@@ -91,17 +116,23 @@ func (s *LocalStore) PutEdited(documentID string, reader io.Reader) error {
 	return nil
 }
 
-func (s *LocalStore) GetMeta(documentID string) (*Meta, error) {
+func (s *LocalStore) GetMeta(ctx context.Context, documentID string) (*Meta, error) {
 	lock := s.lockFor(documentID)
 	lock.RLock()
 	defer lock.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return s.readMetaLocked(documentID)
 }
 
-func (s *LocalStore) MarkEdited(documentID string) error {
+func (s *LocalStore) MarkEdited(ctx context.Context, documentID string) error {
 	lock := s.lockFor(documentID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	meta, err := s.readMetaLocked(documentID)
 	if err != nil {
 		return err
@@ -111,10 +142,13 @@ func (s *LocalStore) MarkEdited(documentID string) error {
 	return s.writeMetaLocked(documentID, meta)
 }
 
-func (s *LocalStore) ExtendTTL(documentID string, hours int) error {
+func (s *LocalStore) ExtendTTL(ctx context.Context, documentID string, hours int) error {
 	lock := s.lockFor(documentID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	meta, err := s.readMetaLocked(documentID)
 	if err != nil {
 		return err
@@ -123,14 +157,17 @@ func (s *LocalStore) ExtendTTL(documentID string, hours int) error {
 	return s.writeMetaLocked(documentID, meta)
 }
 
-func (s *LocalStore) Delete(documentID string) error {
+func (s *LocalStore) Delete(ctx context.Context, documentID string) error {
 	lock := s.lockFor(documentID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return os.RemoveAll(filepath.Join(s.root, documentID))
 }
 
-func (s *LocalStore) Expire() (int, error) {
+func (s *LocalStore) Expire(ctx context.Context) (int, error) {
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return 0, err
@@ -138,6 +175,9 @@ func (s *LocalStore) Expire() (int, error) {
 	now := time.Now()
 	var cleaned int
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return cleaned, err
+		}
 		if !e.IsDir() {
 			continue
 		}
@@ -174,6 +214,44 @@ func (s *LocalStore) readMetaLocked(documentID string) (*Meta, error) {
 func (s *LocalStore) writeMetaLocked(documentID string, meta *Meta) error {
 	data, _ := json.MarshalIndent(meta, "", "  ")
 	return os.WriteFile(filepath.Join(s.root, documentID, "meta.json"), data, 0644)
+}
+
+func (s *LocalStore) pathForVariantLocked(documentID string, variant Variant) (string, error) {
+	dir := filepath.Join(s.root, documentID)
+	switch variant {
+	case VariantOriginal:
+		for _, name := range []string{"original", "original.docx"} {
+			p := filepath.Join(dir, name)
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+		return filepath.Join(dir, "original"), nil
+	case VariantLatest:
+		for _, name := range []string{"edited", "edited.docx", "original", "original.docx"} {
+			p := filepath.Join(dir, name)
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+		return "", os.ErrNotExist
+	default:
+		return "", fmt.Errorf("unknown storage variant: %s", variant)
+	}
+}
+
+type sectionReadCloser struct {
+	*io.SectionReader
+	close func() error
+}
+
+func (r *sectionReadCloser) Close() error {
+	return r.close()
+}
+
+func localETag(info os.FileInfo) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", info.Name(), info.Size(), info.ModTime().UnixNano())))
+	return `"` + hex.EncodeToString(sum[:8]) + `"`
 }
 
 func (s *LocalStore) lockFor(documentID string) *sync.RWMutex {

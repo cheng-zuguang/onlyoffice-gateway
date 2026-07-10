@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -12,7 +13,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -92,7 +92,7 @@ func setupGateway(t *testing.T, privPEM, pubPEM string, whitelist []string) (*ht
 // Gateway stores it, returns 201 + document_id.
 func TestUploadDocument(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	uploadJWT := signUploadJWT(t, privPEM, jwt.MapClaims{
 		"service_id":  "test-service",
@@ -129,16 +129,25 @@ func TestUploadDocument(t *testing.T) {
 		t.Fatalf("expected 201 Created, got %d\nbody: %s", resp.StatusCode, string(respBody))
 	}
 
-	entries, _ := os.ReadDir(storageDir)
-	found := false
-	for _, e := range entries {
-		if e.IsDir() {
-			found = true
-			break
-		}
+	respBody, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	json.Unmarshal(respBody, &result)
+	docID, _ := result["document_id"].(string)
+	if docID == "" {
+		t.Fatalf("expected document_id in upload response, got %s", string(respBody))
 	}
-	if !found {
-		t.Fatal("expected document directory to exist in storage")
+
+	downloadResp, err := http.Get(server.URL + "/download/" + docID)
+	if err != nil {
+		t.Fatalf("download original: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	downloaded, _ := io.ReadAll(downloadResp.Body)
+	if downloadResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected original download 200, got %d: %s", downloadResp.StatusCode, string(downloaded))
+	}
+	if string(downloaded) != "fake-docx-content" {
+		t.Fatalf("expected original content, got %q", string(downloaded))
 	}
 }
 
@@ -260,10 +269,10 @@ func uploadTestDocument(t *testing.T, serverURL, privPEM, serviceID, webhookURL 
 // S5: Download returns edited document with 200.
 func TestDownloadDocument(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
-	markDocumentEdited(t, storageDir, docID, "edited file content")
+	saveEditedViaCallback(t, server.URL, docID, "edited file content")
 
 	req, _ := http.NewRequest("GET", server.URL+"/api/v1/documents/"+docID, nil)
 	resp, err := http.DefaultClient.Do(req)
@@ -285,10 +294,10 @@ func TestDownloadDocument(t *testing.T) {
 
 func TestDocumentServerDownloadServesOriginalWithCacheHeaders(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
-	markDocumentEdited(t, storageDir, docID, "edited file content")
+	saveEditedViaCallback(t, server.URL, docID, "edited file content")
 
 	resp, err := http.Get(server.URL + "/download/" + docID)
 	if err != nil {
@@ -318,6 +327,54 @@ func TestDocumentServerDownloadServesOriginalWithCacheHeaders(t *testing.T) {
 	}
 }
 
+func TestDocumentServerDownloadSupportsByteRanges(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	req, _ := http.NewRequest("GET", server.URL+"/download/"+docID, nil)
+	req.Header.Set("Range", "bytes=0-3")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request range download: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("expected 206 Partial Content, got %d: %s", resp.StatusCode, string(body))
+	}
+	if string(body) != "test" {
+		t.Fatalf("expected first four bytes, got %q", string(body))
+	}
+	if got := resp.Header.Get("Content-Range"); got != "bytes 0-3/12" {
+		t.Fatalf("expected Content-Range bytes 0-3/12, got %q", got)
+	}
+}
+
+func TestDocumentServerDownloadRejectsInvalidByteRange(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	req, _ := http.NewRequest("GET", server.URL+"/download/"+docID, nil)
+	req.Header.Set("Range", "bytes=100-200")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request invalid range download: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("expected 416, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Range"); got != "bytes */12" {
+		t.Fatalf("expected Content-Range bytes */12, got %q", got)
+	}
+}
+
 // S6: Download nonexistent document returns 404.
 func TestDownloadReturns404ForMissing(t *testing.T) {
 	_, pubPEM := generateRSAKeyPair(t)
@@ -332,17 +389,26 @@ func TestDownloadReturns404ForMissing(t *testing.T) {
 	}
 }
 
-func markDocumentEdited(t *testing.T, storageDir, documentID, content string) {
+func saveEditedViaCallback(t *testing.T, serverURL, documentID, content string) {
 	t.Helper()
-	dir := filepath.Join(storageDir, documentID)
-	os.WriteFile(filepath.Join(dir, "edited.docx"), []byte(content), 0644)
-	metaPath := filepath.Join(dir, "meta.json")
-	data, _ := os.ReadFile(metaPath)
-	var meta map[string]interface{}
-	json.Unmarshal(data, &meta)
-	meta["is_edited"] = true
-	newData, _ := json.Marshal(meta)
-	os.WriteFile(metaPath, newData, 0644)
+	fakeDocServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(content))
+	}))
+	defer fakeDocServer.Close()
+
+	callbackBody := bytes.NewReader(toJSON(map[string]interface{}{
+		"status": 2,
+		"key":    documentID,
+		"url":    fakeDocServer.URL + "/cached-file.docx",
+	}))
+	req, _ := http.NewRequest("POST", serverURL+"/callback", callbackBody)
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected callback 200, got %d", resp.StatusCode)
+	}
+	time.Sleep(500 * time.Millisecond)
 }
 
 // S7: ONLYOFFICE callback (status=2) saves the edited document.
@@ -444,16 +510,17 @@ func TestTTLExtendOnEditing(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	metaPath := filepath.Join(storageDir, docID, "meta.json")
-	data, _ := os.ReadFile(metaPath)
-	var meta map[string]interface{}
-	json.Unmarshal(data, &meta)
+	storageStore, err := storage.NewLocalStore(storageDir)
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	meta, err := storageStore.GetMeta(context.Background(), docID)
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
 
-	expiresStr, _ := meta["expires_at"].(string)
-	expiresAt, _ := time.Parse(time.RFC3339, expiresStr)
-
-	if time.Until(expiresAt) < 55*time.Minute {
-		t.Fatalf("expected TTL to be extended to ~1 hour from now, got %s", expiresStr)
+	if time.Until(meta.ExpiresAt) < 55*time.Minute {
+		t.Fatalf("expected TTL to be extended to ~1 hour from now, got %s", meta.ExpiresAt.Format(time.RFC3339))
 	}
 }
 
@@ -581,7 +648,7 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 	}
 
 	storageStore, _ := storage.NewLocalStore(storageDir)
-	count, err := storageStore.Expire()
+	count, err := storageStore.Expire(context.Background())
 	if err != nil {
 		t.Fatalf("expire failed: %v", err)
 	}
@@ -614,7 +681,7 @@ func truncate(s string, n int) string {
 // S24: Callback debounce — rapid callbacks within 200ms only process the last.
 func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
-	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
 
@@ -642,10 +709,14 @@ func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 
 	time.Sleep(600 * time.Millisecond)
 
-	editedPath := filepath.Join(storageDir, docID, "edited.docx")
-	data, err := os.ReadFile(editedPath)
+	resp, err := http.Get(server.URL + "/api/v1/documents/" + docID)
 	if err != nil {
-		t.Fatalf("edited file not found: %v", err)
+		t.Fatalf("download edited file: %v", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected edited download 200, got %d: %s", resp.StatusCode, string(data))
 	}
 	if string(data) != "version-5" {
 		t.Fatalf("expected version-5 from last (debounced) callback, got: %s", string(data))

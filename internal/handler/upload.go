@@ -83,7 +83,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:       now.Add(time.Duration(h.cfg.TTLHours) * time.Hour),
 	}
 
-	if err := h.store.Put(documentID, file, meta); err != nil {
+	if err := h.store.Put(r.Context(), documentID, file, meta); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "storage error"})
 		return
 	}

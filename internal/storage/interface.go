@@ -1,9 +1,13 @@
 package storage
 
 import (
+	"context"
+	"errors"
 	"io"
 	"time"
 )
+
+var ErrInvalidRange = errors.New("invalid byte range")
 
 type Meta struct {
 	DocumentID      string    `json:"document_id"`
@@ -22,14 +26,32 @@ type Meta struct {
 	ConfigOverrides any       `json:"config_overrides,omitempty"`
 }
 
+type Variant string
+
+const (
+	VariantOriginal Variant = "original"
+	VariantLatest   Variant = "latest"
+)
+
+type ByteRange struct {
+	Start int64
+	End   int64
+}
+
+type ObjectInfo struct {
+	Size         int64
+	ETag         string
+	LastModified time.Time
+	ContentType  string
+}
+
 type Store interface {
-	Put(documentID string, reader io.Reader, meta Meta) error
-	Get(documentID string) (io.ReadCloser, error)
-	GetOriginal(documentID string) (io.ReadSeekCloser, *Meta, error)
-	PutEdited(documentID string, reader io.Reader) error
-	GetMeta(documentID string) (*Meta, error)
-	MarkEdited(documentID string) error
-	ExtendTTL(documentID string, hours int) error
-	Delete(documentID string) error
-	Expire() (int, error)
+	Put(ctx context.Context, documentID string, reader io.Reader, meta Meta) error
+	Open(ctx context.Context, documentID string, variant Variant, byteRange *ByteRange) (io.ReadCloser, *Meta, *ObjectInfo, error)
+	PutEdited(ctx context.Context, documentID string, reader io.Reader) error
+	GetMeta(ctx context.Context, documentID string) (*Meta, error)
+	MarkEdited(ctx context.Context, documentID string) error
+	ExtendTTL(ctx context.Context, documentID string, hours int) error
+	Delete(ctx context.Context, documentID string) error
+	Expire(ctx context.Context) (int, error)
 }

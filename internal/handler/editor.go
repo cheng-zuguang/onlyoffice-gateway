@@ -44,7 +44,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta, err := h.store.GetMeta(documentID)
+	meta, err := h.store.GetMeta(r.Context(), documentID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
 		return

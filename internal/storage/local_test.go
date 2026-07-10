@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"io"
 	"strings"
 	"testing"
@@ -29,7 +30,7 @@ func TestPutEditedDoesNotBlockOtherDocumentMetadataReads(t *testing.T) {
 	}
 	now := time.Now()
 	for _, docID := range []string{"doc-a", "doc-b"} {
-		if err := store.Put(docID, strings.NewReader("original"), Meta{
+		if err := store.Put(context.Background(), docID, strings.NewReader("original"), Meta{
 			DocumentID: docID,
 			FileName:   docID + ".docx",
 			CreatedAt:  now,
@@ -42,7 +43,7 @@ func TestPutEditedDoesNotBlockOtherDocumentMetadataReads(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		_ = store.PutEdited("doc-a", &slowReader{release: release})
+		_ = store.PutEdited(context.Background(), "doc-a", &slowReader{release: release})
 		close(done)
 	}()
 
@@ -50,7 +51,7 @@ func TestPutEditedDoesNotBlockOtherDocumentMetadataReads(t *testing.T) {
 	start := time.Now()
 	readDone := make(chan error, 1)
 	go func() {
-		_, err := store.GetMeta("doc-b")
+		_, err := store.GetMeta(context.Background(), "doc-b")
 		readDone <- err
 	}()
 	select {

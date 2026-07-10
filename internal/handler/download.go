@@ -3,6 +3,7 @@ package handler
 import (
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/storage"
@@ -25,7 +26,7 @@ func (h *DownloadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	meta, err := h.store.GetMeta(documentID)
+	meta, err := h.store.GetMeta(r.Context(), documentID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
 		return
@@ -36,7 +37,7 @@ func (h *DownloadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reader, err := h.store.Get(documentID)
+	reader, _, info, err := h.store.Open(r.Context(), documentID, storage.VariantLatest, nil)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document file not found"})
 		return
@@ -45,5 +46,8 @@ func (h *DownloadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", "attachment; filename="+meta.FileName)
 	w.Header().Set("Content-Type", "application/octet-stream")
+	if info != nil && info.Size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+	}
 	io.Copy(w, reader)
 }

@@ -1,11 +1,16 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rsa"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +27,7 @@ type ServiceResolver interface {
 }
 
 func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
-	store, err := storage.NewLocalStore(cfg.StorageDir)
+	store, err := storage.NewStore(context.Background(), cfg)
 	if err != nil {
 		panic("failed to create storage: " + err.Error())
 	}
@@ -44,16 +49,7 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 
 	mux.HandleFunc("GET /download/{docId}", func(w http.ResponseWriter, r *http.Request) {
 		docID := r.PathValue("docId")
-		reader, meta, err := store.GetOriginal(docID)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		defer reader.Close()
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Cache-Control", "private, max-age=28800")
-		w.Header().Set("ETag", `"`+meta.EditorKey+`"`)
-		http.ServeContent(w, r, meta.FileName, meta.CreatedAt, reader)
+		serveOriginalDocument(w, r, store, docID)
 	})
 
 	mux.HandleFunc("GET /api/v1/health/ds", func(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +82,152 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 	registerDocumentServerProxy(mux, cfg.DocumentServerURL)
 
 	return mux
+}
+
+func serveOriginalDocument(w http.ResponseWriter, r *http.Request, store storage.Store, docID string) {
+	meta, err := store.GetMeta(r.Context(), docID)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	reader, _, info, err := store.Open(r.Context(), docID, storage.VariantOriginal, nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	reader.Close()
+
+	etag := `"` + meta.EditorKey + `"`
+	lastModified := meta.CreatedAt.UTC()
+	if lastModified.IsZero() && info != nil {
+		lastModified = info.LastModified.UTC()
+	}
+	if checkNotModified(w, r, etag, lastModified) {
+		return
+	}
+
+	byteRange, status := parseRangeHeader(r.Header.Get("Range"), info.Size)
+	if status == http.StatusRequestedRangeNotSatisfiable {
+		setOriginalHeaders(w, meta, info, etag, lastModified)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+
+	reader, _, info, err = store.Open(r.Context(), docID, storage.VariantOriginal, byteRange)
+	if err != nil {
+		if errors.Is(err, storage.ErrInvalidRange) {
+			setOriginalHeaders(w, meta, info, etag, lastModified)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer reader.Close()
+
+	setOriginalHeaders(w, meta, info, etag, lastModified)
+	if byteRange == nil {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, reader)
+		return
+	}
+	end := byteRange.End
+	if end >= info.Size {
+		end = info.Size - 1
+	}
+	length := end - byteRange.Start + 1
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", byteRange.Start, end, info.Size))
+	w.WriteHeader(http.StatusPartialContent)
+	io.Copy(w, reader)
+}
+
+func setOriginalHeaders(w http.ResponseWriter, meta *storage.Meta, info *storage.ObjectInfo, etag string, lastModified time.Time) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "private, max-age=28800")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("ETag", etag)
+	if !lastModified.IsZero() {
+		w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
+	}
+	if meta != nil && meta.FileName != "" {
+		w.Header().Set("Content-Disposition", "inline; filename="+meta.FileName)
+	}
+	if info != nil && info.ContentType != "" {
+		w.Header().Set("Content-Type", info.ContentType)
+	}
+}
+
+func checkNotModified(w http.ResponseWriter, r *http.Request, etag string, lastModified time.Time) bool {
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		for _, candidate := range strings.Split(match, ",") {
+			if strings.TrimSpace(candidate) == etag || strings.TrimSpace(candidate) == "*" {
+				w.Header().Set("ETag", etag)
+				w.WriteHeader(http.StatusNotModified)
+				return true
+			}
+		}
+	}
+	if sinceHeader := r.Header.Get("If-Modified-Since"); sinceHeader != "" && !lastModified.IsZero() {
+		if since, err := http.ParseTime(sinceHeader); err == nil && !lastModified.After(since) {
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
+			w.WriteHeader(http.StatusNotModified)
+			return true
+		}
+	}
+	return false
+}
+
+func parseRangeHeader(header string, size int64) (*storage.ByteRange, int) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return nil, http.StatusOK
+	}
+	if !strings.HasPrefix(header, "bytes=") || strings.Contains(header, ",") {
+		return nil, http.StatusRequestedRangeNotSatisfiable
+	}
+	if size <= 0 {
+		return nil, http.StatusRequestedRangeNotSatisfiable
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	startText, endText, ok := strings.Cut(spec, "-")
+	if !ok {
+		return nil, http.StatusRequestedRangeNotSatisfiable
+	}
+	if startText == "" {
+		suffix, err := strconv.ParseInt(endText, 10, 64)
+		if err != nil || suffix <= 0 {
+			return nil, http.StatusRequestedRangeNotSatisfiable
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return &storage.ByteRange{Start: size - suffix, End: size - 1}, http.StatusPartialContent
+	}
+	start, err := strconv.ParseInt(startText, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return nil, http.StatusRequestedRangeNotSatisfiable
+	}
+	end := size - 1
+	if endText != "" {
+		parsedEnd, err := strconv.ParseInt(endText, 10, 64)
+		if err != nil || parsedEnd < start {
+			return nil, http.StatusRequestedRangeNotSatisfiable
+		}
+		end = parsedEnd
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return &storage.ByteRange{Start: start, End: end}, http.StatusPartialContent
 }
 
 func registerDocumentServerProxy(mux *http.ServeMux, documentServerURL string) {
