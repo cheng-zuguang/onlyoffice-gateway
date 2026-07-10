@@ -52,6 +52,47 @@ func (s *LocalStore) Put(ctx context.Context, documentID string, reader io.Reade
 	return nil
 }
 
+func (s *LocalStore) Create(ctx context.Context, documentID string, meta Meta) error {
+	lock := s.lockFor(documentID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dir := filepath.Join(s.root, documentID)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create doc dir: %w", err)
+	}
+	return s.writeMetaLocked(documentID, &meta)
+}
+
+func (s *LocalStore) Stat(ctx context.Context, documentID string, variant Variant) (*Meta, *ObjectInfo, error) {
+	lock := s.lockFor(documentID)
+	lock.RLock()
+	defer lock.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	meta, err := s.readMetaLocked(documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	path, err := s.pathForVariantLocked(documentID, variant)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return meta, &ObjectInfo{
+		Size:         info.Size(),
+		ETag:         localETag(info),
+		LastModified: info.ModTime(),
+		ContentType:  "application/octet-stream",
+	}, nil
+}
+
 func (s *LocalStore) Open(ctx context.Context, documentID string, variant Variant, byteRange *ByteRange) (io.ReadCloser, *Meta, *ObjectInfo, error) {
 	lock := s.lockFor(documentID)
 	lock.RLock()

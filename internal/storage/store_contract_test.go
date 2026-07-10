@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sort"
 	"strconv"
@@ -48,6 +49,17 @@ func runStoreContract(t *testing.T, store Store) {
 
 	if err := store.Put(ctx, meta.DocumentID, strings.NewReader("original-content"), meta); err != nil {
 		t.Fatalf("put original: %v", err)
+	}
+
+	statMeta, statInfo, err := store.Stat(ctx, meta.DocumentID, VariantOriginal)
+	if err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
+	if statMeta.DocumentID != meta.DocumentID {
+		t.Fatalf("expected stat meta for %s, got %s", meta.DocumentID, statMeta.DocumentID)
+	}
+	if statInfo.Size != int64(len("original-content")) {
+		t.Fatalf("expected stat size %d, got %d", len("original-content"), statInfo.Size)
 	}
 
 	body, readMeta, info := openAndRead(t, store, meta.DocumentID, VariantOriginal, nil)
@@ -165,9 +177,51 @@ type fakeS3Object struct {
 	lastModified time.Time
 }
 
+func TestS3StoreDeleteBatchesMoreThanOneThousandObjects(t *testing.T) {
+	client := newFakeS3Client()
+	store := NewS3StoreWithClient(client, "bucket", "documents")
+	for i := 0; i < 1001; i++ {
+		key := fmt.Sprintf("documents/doc-large/part-%04d", i)
+		client.objects[key] = fakeS3Object{body: []byte("x")}
+	}
+	if err := store.Delete(context.Background(), "doc-large"); err != nil {
+		t.Fatalf("delete large document: %v", err)
+	}
+	if len(client.objects) != 0 {
+		t.Fatalf("expected all objects to be deleted, got %d remaining", len(client.objects))
+	}
+}
+
+func TestS3StoreStatDoesNotDownloadObjectBody(t *testing.T) {
+	client := newFakeS3Client()
+	store := NewS3StoreWithClient(client, "bucket", "documents")
+	meta := Meta{
+		DocumentID: "doc-stat",
+		FileName:   "stat.docx",
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Now().Add(time.Hour),
+	}
+	if err := store.Put(context.Background(), meta.DocumentID, strings.NewReader("original"), meta); err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+	client.getObjectCalls = 0
+
+	_, info, err := store.Stat(context.Background(), meta.DocumentID, VariantOriginal)
+	if err != nil {
+		t.Fatalf("stat object: %v", err)
+	}
+	if info.Size != int64(len("original")) {
+		t.Fatalf("expected stat size %d, got %d", len("original"), info.Size)
+	}
+	if client.getObjectCalls != 1 {
+		t.Fatalf("expected Stat to read only meta via GetObject, got %d GetObject calls", client.getObjectCalls)
+	}
+}
+
 type fakeS3Client struct {
-	mu      sync.Mutex
-	objects map[string]fakeS3Object
+	mu             sync.Mutex
+	objects        map[string]fakeS3Object
+	getObjectCalls int
 }
 
 func newFakeS3Client() *fakeS3Client {
@@ -194,6 +248,7 @@ func (c *fakeS3Client) PutObject(ctx context.Context, input *s3.PutObjectInput, 
 func (c *fakeS3Client) GetObject(ctx context.Context, input *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.getObjectCalls++
 	obj, ok := c.objects[aws.ToString(input.Key)]
 	if !ok {
 		return nil, fakeS3NotFound()
@@ -251,6 +306,9 @@ func (c *fakeS3Client) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV
 func (c *fakeS3Client) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput, opts ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(input.Delete.Objects) > 1000 {
+		return nil, fmt.Errorf("s3 delete batch exceeds 1000 objects")
+	}
 	for _, object := range input.Delete.Objects {
 		delete(c.objects, aws.ToString(object.Key))
 	}

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,7 +45,7 @@ func (h *DownloadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer reader.Close()
 
-	w.Header().Set("Content-Disposition", "attachment; filename="+meta.FileName)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": meta.FileName}))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	if info != nil && info.Size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))

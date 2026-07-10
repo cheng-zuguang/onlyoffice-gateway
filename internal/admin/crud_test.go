@@ -2,13 +2,30 @@ package admin_test
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/admin"
 )
+
+func validPublicKeyPEM(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	pubBytes, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes}))
+}
 
 func loginAndGetToken(t *testing.T, srvURL string) string {
 	t.Helper()
@@ -101,7 +118,7 @@ func TestCreateAndListService(t *testing.T) {
 
 	svc := admin.ServiceRecord{
 		ID:                    "my-app",
-		PublicKeyPEM:          "-----BEGIN PUBLIC KEY-----\nkey-data\n-----END PUBLIC KEY-----",
+		PublicKeyPEM:          validPublicKeyPEM(t),
 		AllowedWebhookDomains: []string{"myapp.example.com", "localhost"},
 	}
 	resp := authPost(t, srv.URL+"/admin/api/services", token, svc)
@@ -133,7 +150,7 @@ func TestCreateDuplicateService(t *testing.T) {
 	srv, _ := newAdminServer(t)
 	token := loginAndGetToken(t, srv.URL)
 
-	svc := admin.ServiceRecord{ID: "dup", PublicKeyPEM: "pk1"}
+	svc := admin.ServiceRecord{ID: "dup", PublicKeyPEM: validPublicKeyPEM(t)}
 	authPost(t, srv.URL+"/admin/api/services", token, svc)
 
 	resp := authPost(t, srv.URL+"/admin/api/services", token, svc)
@@ -149,7 +166,7 @@ func TestDeleteService(t *testing.T) {
 	srv, _ := newAdminServer(t)
 	token := loginAndGetToken(t, srv.URL)
 
-	svc := admin.ServiceRecord{ID: "to-delete", PublicKeyPEM: "pk"}
+	svc := admin.ServiceRecord{ID: "to-delete", PublicKeyPEM: validPublicKeyPEM(t)}
 	authPost(t, srv.URL+"/admin/api/services", token, svc)
 
 	resp := authDelete(t, srv.URL+"/admin/api/services/to-delete", token)
@@ -247,15 +264,16 @@ func TestUpdateService(t *testing.T) {
 
 	svc := admin.ServiceRecord{
 		ID:                    "my-app",
-		PublicKeyPEM:          "old-key",
+		PublicKeyPEM:          validPublicKeyPEM(t),
 		AllowedWebhookDomains: []string{"old.example.com"},
 	}
 	authPost(t, srv.URL+"/admin/api/services", token, svc)
 
 	// Update
+	newKey := validPublicKeyPEM(t)
 	updated := admin.ServiceRecord{
 		ID:                    "my-app",
-		PublicKeyPEM:          "new-key",
+		PublicKeyPEM:          newKey,
 		AllowedWebhookDomains: []string{"new.example.com", "also.example.com"},
 	}
 	resp := authPut(t, srv.URL+"/admin/api/services/my-app", token, updated)
@@ -267,8 +285,8 @@ func TestUpdateService(t *testing.T) {
 
 	var result admin.ServiceRecord
 	json.NewDecoder(resp.Body).Decode(&result)
-	if result.PublicKeyPEM != "new-key" {
-		t.Fatalf("expected public_key 'new-key', got '%s'", result.PublicKeyPEM)
+	if result.PublicKeyPEM != newKey {
+		t.Fatalf("expected updated public_key, got '%s'", result.PublicKeyPEM)
 	}
 	if len(result.AllowedWebhookDomains) != 2 || result.AllowedWebhookDomains[0] != "new.example.com" {
 		t.Fatalf("expected domains [new.example.com, also.example.com], got %v", result.AllowedWebhookDomains)
@@ -282,11 +300,71 @@ func TestUpdateNonexistentService(t *testing.T) {
 
 	resp := authPut(t, srv.URL+"/admin/api/services/nope", token, admin.ServiceRecord{
 		ID:           "nope",
-		PublicKeyPEM: "key",
+		PublicKeyPEM: validPublicKeyPEM(t),
 	})
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestCreateServiceRejectsInvalidPublicKey(t *testing.T) {
+	srv, _ := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	resp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:                    "bad-key",
+		PublicKeyPEM:          "not a pem public key",
+		AllowedWebhookDomains: []string{"myapp.example.com"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid public key, got %d", resp.StatusCode)
+	}
+
+	resp2 := authGet(t, srv.URL+"/admin/api/services", token)
+	defer resp2.Body.Close()
+	var list []admin.ServiceRecord
+	json.NewDecoder(resp2.Body).Decode(&list)
+	if len(list) != 0 {
+		t.Fatalf("invalid service must not be registered, got %d services", len(list))
+	}
+}
+
+func TestUpdateServiceRejectsInvalidPublicKeyWithoutChangingExistingService(t *testing.T) {
+	srv, _ := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+	originalKey := validPublicKeyPEM(t)
+
+	authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:                    "my-app",
+		PublicKeyPEM:          originalKey,
+		AllowedWebhookDomains: []string{"old.example.com"},
+	})
+
+	resp := authPut(t, srv.URL+"/admin/api/services/my-app", token, admin.ServiceRecord{
+		ID:                    "my-app",
+		PublicKeyPEM:          "not a pem public key",
+		AllowedWebhookDomains: []string{"new.example.com"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid public key, got %d", resp.StatusCode)
+	}
+
+	resp2 := authGet(t, srv.URL+"/admin/api/services", token)
+	defer resp2.Body.Close()
+	var list []admin.ServiceRecord
+	json.NewDecoder(resp2.Body).Decode(&list)
+	if len(list) != 1 {
+		t.Fatalf("expected existing service to remain, got %d services", len(list))
+	}
+	if list[0].PublicKeyPEM != originalKey {
+		t.Fatal("invalid update must not replace the existing public key")
+	}
+	if len(list[0].AllowedWebhookDomains) != 1 || list[0].AllowedWebhookDomains[0] != "old.example.com" {
+		t.Fatalf("invalid update must not replace domains, got %v", list[0].AllowedWebhookDomains)
 	}
 }

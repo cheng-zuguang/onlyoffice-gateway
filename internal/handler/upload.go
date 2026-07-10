@@ -2,7 +2,10 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"mime/multipart"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
@@ -45,6 +48,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	externalID, _ := claims["external_id"].(string)
 	fileName, _ := claims["file_name"].(string)
 	docType, _ := claims["document_type"].(string)
+	sourceURL, _ := claims["source_url"].(string)
 
 	// Validate webhook domain
 	if serviceID != "" {
@@ -55,13 +59,30 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Read uploaded file
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file"})
+	if docType != "" && !isSupportedDocumentType(docType) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported document_type"})
 		return
 	}
-	defer file.Close()
+	if sourceURL != "" && !isSafeSourceURL(sourceURL) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source_url must be an https URL"})
+		return
+	}
+
+	var file multipart.File
+	if sourceURL == "" {
+		r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxUploadBytes)
+		file, _, err = r.FormFile("file")
+		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "file too large"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file"})
+			return
+		}
+		defer file.Close()
+	}
 
 	// Generate document ID and editor key
 	documentID := generateDocID()
@@ -79,11 +100,17 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FileType:        docTypeToFileType(docType),
 		DocumentType:    docType,
 		EditorKey:       editorKey,
+		SourceURL:       sourceURL,
 		CreatedAt:       now,
 		ExpiresAt:       now.Add(time.Duration(h.cfg.TTLHours) * time.Hour),
 	}
 
-	if err := h.store.Put(r.Context(), documentID, file, meta); err != nil {
+	if sourceURL != "" {
+		err = h.store.Create(r.Context(), documentID, meta)
+	} else {
+		err = h.store.Put(r.Context(), documentID, file, meta)
+	}
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "storage error"})
 		return
 	}
@@ -93,6 +120,20 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"status":      "uploaded",
 		"expires_at":  meta.ExpiresAt.Format(time.RFC3339),
 	})
+}
+
+func isSafeSourceURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil
+}
+
+func isSupportedDocumentType(documentType string) bool {
+	switch documentType {
+	case "word", "cell", "slide", "pdf":
+		return true
+	default:
+		return false
+	}
 }
 
 func isDomainAllowed(allowedDomains []string, rawURL string) bool {

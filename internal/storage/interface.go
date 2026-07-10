@@ -18,6 +18,7 @@ type Meta struct {
 	FileType        string    `json:"file_type"`
 	DocumentType    string    `json:"document_type"`
 	EditorKey       string    `json:"editor_key"`
+	SourceURL       string    `json:"source_url,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	ExpiresAt       time.Time `json:"expires_at"`
 	IsEdited        bool      `json:"is_edited"`
@@ -47,6 +48,8 @@ type ObjectInfo struct {
 
 type Store interface {
 	Put(ctx context.Context, documentID string, reader io.Reader, meta Meta) error
+	Create(ctx context.Context, documentID string, meta Meta) error
+	Stat(ctx context.Context, documentID string, variant Variant) (*Meta, *ObjectInfo, error)
 	Open(ctx context.Context, documentID string, variant Variant, byteRange *ByteRange) (io.ReadCloser, *Meta, *ObjectInfo, error)
 	PutEdited(ctx context.Context, documentID string, reader io.Reader) error
 	GetMeta(ctx context.Context, documentID string) (*Meta, error)

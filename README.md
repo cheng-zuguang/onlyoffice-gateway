@@ -66,7 +66,10 @@ DOCUMENT_SERVER_URL=http://localhost:18000
 JWT_SECRET=                          # 与 Document Server 一致
 STORAGE_DIR=./data/storage
 TTL_HOURS=8
+CLEANUP_INTERVAL=1h
 WEBHOOK_MAX_RETRIES=3
+CALLBACK_QUEUE_SIZE=64
+CALLBACK_WORKERS=4
 
 # Admin Panel
 ADMIN_USERNAME=admin
@@ -74,7 +77,15 @@ ADMIN_PASSWORD=admin123              # 生产环境务必修改
 SERVICE_STORE_PATH=./data/services.json
 ```
 
-Gateway 核心配置通过 `.env` 环境变量注入。全部配置通过 `.env` 环境变量注入。
+Gateway 核心配置可通过 `.env` 环境变量注入，也可通过启动参数指定 `gateway.yaml`。
+
+使用 `gateway.yaml` 时，清理间隔使用相同的 Go 时长格式：
+
+```yaml
+cleanup_interval: 15m
+callback_queue_size: 64
+callback_workers: 4
+```
 
 ### 2. 启动
 
@@ -173,6 +184,16 @@ Admin API 使用 HMAC-SHA256 JWT 认证（复用 `JWT_SECRET`），24h 过期。
 
 ### POST /api/v1/documents
 
+Gateway 支持两种文件接入模式；同一服务可按文档选择使用。
+
+| 场景 | 推荐模式 | Gateway 是否保存文件 | 结果获取方式 |
+|---|---|---|---|
+| 业务服务没有对象存储，或希望 Gateway 临时托管文件 | multipart 上传托管 | 保存原文件和编辑后文件，按 TTL 清理 | webhook 后调用 `GET /api/v1/documents/{id}` |
+| 业务服务已将文件存在 S3/对象存储 | `source_url` 直连 | 只保存元数据，不保存文件字节 | webhook 中读取 `edited_url` 并立即保存回业务 S3 |
+| 本地/MinIO 只能提供 HTTP URL | multipart 上传托管 | 保存原文件和编辑后文件 | 避免把 HTTP MinIO URL 放入 `source_url` |
+
+#### 模式 A：上传托管（multipart）
+
 **Headers**:
 - `Authorization: Bearer <JWT>`（RS256，服务私钥自签）
 - `Content-Type: multipart/form-data`
@@ -192,6 +213,26 @@ Admin API 使用 HMAC-SHA256 JWT 认证（复用 `JWT_SECRET`），24h 过期。
 | `config_overrides` | | ONLYOFFICE config 完全覆盖 |
 | `exp` | ✅ | 上传 token 有效期，控制调用 API 的时间窗口。生成后应立即使用，建议 60s 以防范重放 |
 
+#### 模式 B：业务 S3 直连（`source_url`）
+
+适用于业务服务已管理 S3（或其他对象存储）的场景。将短时效、可由 Document Server 访问的预签名 **GET** URL 放入已签名 JWT 的 `source_url` claim，并以空请求体调用同一端点。Gateway 只保存编辑会话元数据，不接收、复制或清理原文件；ONLYOFFICE 直接下载该 URL。
+
+```javascript
+const token = jwt.sign({
+  service_id: 'my-app',
+  webhook_url: 'https://my-app.example.com/callback',
+  source_url: 'https://bucket.s3.example.com/report.docx?...',
+  file_name: 'report.docx',
+  document_type: 'word',
+}, privateKey, { algorithm: 'RS256', expiresIn: '60s' });
+
+await fetch(`${gatewayUrl}/api/v1/documents`, {
+  method: 'POST', headers: { Authorization: `Bearer ${token}` },
+});
+```
+
+`source_url` 必须覆盖编辑会话期间 Document Server 的读取需求，必须是 HTTPS URL，且不可包含用户名/密码或指向仅浏览器可访问的内网地址。业务服务负责原文件和最终文件的 S3 生命周期策略；Gateway 在该模式下只保存会话元数据，不会下载或清理业务 S3 中的对象。
+
 ### 编辑器定制
 
 三层 merge 构建 ONLYOFFICE config：
@@ -209,18 +250,38 @@ POST <webhook_url>
 X-Gateway-Event: document.saved
 X-Gateway-Signature: sha256=<HMAC(url+body, jwt_secret)>
 
-{ "event": "document.saved", "document_id": "doc_xxx", "status": "ready" }
+{ "event": "document.saved", "document_id": "doc_xxx", "status": "ready", "edited_url": "..." }
 ```
 
-Gateway 对 Webhook 做有限重试（3 次，指数退避），失败后静默。
+在 S3 直连模式下，`edited_url` 是 ONLYOFFICE 提供的短时效下载地址；Gateway 不读取其内容，业务服务必须在收到 webhook 后立即下载并保存回自己的对象存储。在 multipart 模式下，该字段为空，业务侧仍可使用 `GET /api/v1/documents/{id}` 获取 Gateway 保存的结果。
+
+直连模式下业务 webhook 的推荐处理流程：
+
+```javascript
+app.post('/onlyoffice/webhook', async (req, res) => {
+  verifyGatewaySignature(req);
+  const { document_id, external_id, edited_url } = req.body;
+  if (edited_url) {
+    const edited = await fetch(edited_url);
+    if (!edited.ok) throw new Error(`download edited file failed: ${edited.status}`);
+    await putObjectToBusinessS3(external_id || document_id, edited.body);
+  } else {
+    await copyFromGatewayResult(document_id);
+  }
+  res.sendStatus(204);
+});
+```
+
+Gateway 对 Webhook 做有限重试（3 次，指数退避并附加短 jitter），失败后记录指标和日志。保存任务会先进入有界队列，队列大小由 `CALLBACK_QUEUE_SIZE` 控制，worker 数由 `CALLBACK_WORKERS` 控制。收到 `SIGTERM` 或 `SIGINT` 后，Gateway 会先停止 HTTP 接入，再停止本地清理调度并排空已入队的保存任务。
 
 保存回调中，Gateway 会从 Document Server 回调体的 `url` 下载编辑后文件并保存为最新版。该下载和 Webhook 投递共用带连接池的 HTTP client，支持 keep-alive 和连接复用，降低高并发保存时的连接建立开销。
 
 ## 性能与缓存
 
 - Document Server 前端资源代理会为 `/web-apps/`、`/sdkjs/`、`/spellchecker/`、`/cache/` 等静态资源设置缓存头；版本化资源使用 `public, max-age=31536000, immutable`。
-- `/download/{docId}` 面向 Document Server 返回原始文件，支持 Range 请求和条件请求，业务侧 `/api/v1/documents/{id}` 仍返回编辑完成后的最新版。
+- `/download/{docId}` 面向 Document Server 返回原始文件，支持 Range 请求和条件请求；条件请求会先读取对象元信息，命中 304 或非法 Range 时不会下载对象正文。业务侧 `/api/v1/documents/{id}` 仍返回编辑完成后的最新版。
 - 本地 storage 采用按文档 ID 的锁粒度，不同文档的上传、读取、保存不会被单个文档的大文件写入全局阻塞。
+- `/api/v1/metrics` 以 Prometheus text exposition 格式暴露 callback 保存排队/丢弃/成功/失败次数和 webhook 成功/失败次数，包含 `HELP` 与 `TYPE` 元信息。
 
 ## 部署
 
@@ -264,10 +325,13 @@ docker compose up -d
 | `S3_USE_SSL` | `true` | endpoint 未带 scheme 时是否默认使用 HTTPS |
 | `S3_PREFIX` | — | 对象 key 前缀，例如 `documents` |
 | `TTL_HOURS` | `8` | 文档存活时间 |
+| `CLEANUP_INTERVAL` | `1h` | 本地存储过期文档清理间隔，仅 `STORAGE_BACKEND=local` 生效；环境变量和 YAML 均支持 `15m`、`1h` 格式 |
 | `WEBHOOK_MAX_RETRIES` | `3` | Webhook 最大重试次数 |
+| `CALLBACK_QUEUE_SIZE` | `64` | 保存回调有界队列长度 |
+| `CALLBACK_WORKERS` | `4` | 保存回调并发 worker 数 |
 | `ADMIN_USERNAME` | `admin` | 管理端用户名 |
 | `ADMIN_PASSWORD` | — | **必须设置** |
-| `SERVICE_STORE_PATH` | `./data/services.json` | Service 持久化文件 |
+| `SERVICE_STORE_PATH` | `./data/services.json` | Service 持久化文件，Admin API 会校验 RSA 公钥并原子写入 |
 
 ### 访问日志
 

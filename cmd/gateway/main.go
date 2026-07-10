@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/admin"
@@ -31,6 +35,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
 
 	serviceStorePath := os.Getenv("SERVICE_STORE_PATH")
 	if serviceStorePath == "" {
@@ -51,7 +58,7 @@ func main() {
 		log.Println("  Create a .env file:  cp .env.example .env  →  edit ADMIN_PASSWORD")
 	}
 
-	handler := newRootHandler(cfg, serviceStore, adminUser, adminPass)
+	handler, closeGateway := newRootRuntime(cfg, serviceStore, adminUser, adminPass)
 
 	log.Printf("Gateway %s listening on %s", version.Version, cfg.ListenAddr)
 	server := &http.Server{
@@ -62,13 +69,37 @@ func main() {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	if err := server.ListenAndServe(); err != nil {
+	stopSignals := make(chan os.Signal, 1)
+	shutdownComplete := make(chan struct{})
+	signal.Notify(stopSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stopSignals)
+	go func() {
+		<-stopSignals
+		log.Println("shutting down gateway")
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("graceful HTTP shutdown: %v", err)
+		}
+		closeGateway()
+		close(shutdownComplete)
+	}()
+	err = server.ListenAndServe()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		<-shutdownComplete
 	}
 }
 
 func newRootHandler(cfg *config.Config, serviceStore *admin.InMemoryServiceStore, adminUser, adminPass string) http.Handler {
-	gwHandler := gateway.NewHandler(cfg, serviceStore)
+	handler, _ := newRootRuntime(cfg, serviceStore, adminUser, adminPass)
+	return handler
+}
+
+func newRootRuntime(cfg *config.Config, serviceStore *admin.InMemoryServiceStore, adminUser, adminPass string) (http.Handler, func()) {
+	gwRuntime := gateway.NewRuntime(cfg, serviceStore)
 	adminMux := admin.NewMux(admin.Opts{
 		AdminUsername: adminUser,
 		AdminPassword: adminPass,
@@ -78,9 +109,9 @@ func newRootHandler(cfg *config.Config, serviceStore *admin.InMemoryServiceStore
 
 	mux := http.NewServeMux()
 	mux.Handle("/admin/api/", adminMux)
-	mux.Handle("/", gwHandler)
+	mux.Handle("/", gwRuntime.Handler)
 
-	return gateway.LoggingMiddleware(mux)
+	return gateway.LoggingMiddleware(mux), gwRuntime.Close
 }
 
 func loadDotEnv(path string) {

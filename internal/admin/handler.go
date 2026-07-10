@@ -6,9 +6,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -134,12 +136,20 @@ func (h *serviceHandler) handleCreateService(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
 		return
 	}
-	if _, ok := h.store.Get(svc.ID); ok {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "service id already exists"})
+	if err := h.store.Create(svc); err != nil {
+		if err == errServiceExists {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "service id already exists"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	h.store.Add(svc)
-	writeJSON(w, http.StatusCreated, svc)
+	created, ok := h.store.Get(svc.ID)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "service was not created"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
 }
 
 func (h *serviceHandler) handleUpdateService(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +161,11 @@ func (h *serviceHandler) handleUpdateService(w http.ResponseWriter, r *http.Requ
 	}
 	svc.ID = id
 	if err := h.store.Update(id, svc); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		if err == errServiceNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	updated, _ := h.store.Get(id)
@@ -160,8 +174,12 @@ func (h *serviceHandler) handleUpdateService(w http.ResponseWriter, r *http.Requ
 
 func (h *serviceHandler) handleDeleteService(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !h.store.Remove(id) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+	if err := h.store.Delete(id); err != nil {
+		if err == errServiceNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
@@ -180,9 +198,10 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 // InMemoryServiceStore holds service records in memory, safe for concurrent use.
 // When a path is set, Add and Remove persist to disk.
 type InMemoryServiceStore struct {
-	mu       sync.RWMutex
-	services []ServiceRecord
-	path     string
+	mu         sync.RWMutex
+	services   []ServiceRecord
+	publicKeys map[string]*rsa.PublicKey
+	path       string
 }
 
 // ServiceRecord represents one external service authorized to use the gateway.
@@ -192,15 +211,20 @@ type ServiceRecord struct {
 	AllowedWebhookDomains []string `json:"allowed_webhook_domains"`
 }
 
+var (
+	errServiceExists   = errors.New("service id already exists")
+	errServiceNotFound = errors.New("service not found")
+)
+
 // NewInMemoryServiceStore returns an empty in-memory store.
 func NewInMemoryServiceStore() *InMemoryServiceStore {
-	return &InMemoryServiceStore{}
+	return &InMemoryServiceStore{publicKeys: make(map[string]*rsa.PublicKey)}
 }
 
 // NewPersistentServiceStore loads services from a JSON file, or creates an
 // empty file if none exists. Mutations are persisted immediately.
 func NewPersistentServiceStore(path string) (*InMemoryServiceStore, error) {
-	store := &InMemoryServiceStore{path: path}
+	store := &InMemoryServiceStore{path: path, publicKeys: make(map[string]*rsa.PublicKey)}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
@@ -230,53 +254,114 @@ func (s *InMemoryServiceStore) Get(id string) (*ServiceRecord, bool) {
 
 // Resolve returns the parsed RSA public key and webhook domains for a service.
 func (s *InMemoryServiceStore) Resolve(id string) (*rsa.PublicKey, []string, bool) {
-	svc, ok := s.Get(id)
-	if !ok {
-		return nil, nil, false
+	s.mu.RLock()
+	for i := range s.services {
+		if s.services[i].ID == id {
+			pub := s.publicKeys[id]
+			publicKeyPEM := s.services[i].PublicKeyPEM
+			domains := append([]string(nil), s.services[i].AllowedWebhookDomains...)
+			s.mu.RUnlock()
+			if pub != nil {
+				return pub, domains, true
+			}
+			parsed, err := parseRSAPublicKeyPEM(publicKeyPEM)
+			if err != nil {
+				return nil, nil, false
+			}
+			s.mu.Lock()
+			if s.publicKeys == nil {
+				s.publicKeys = make(map[string]*rsa.PublicKey)
+			}
+			s.publicKeys[id] = parsed
+			s.mu.Unlock()
+			return parsed, domains, true
+		}
 	}
-	pub, err := parseRSAPublicKeyPEM(svc.PublicKeyPEM)
-	if err != nil {
-		return nil, nil, false
-	}
-	return pub, svc.AllowedWebhookDomains, true
+	s.mu.RUnlock()
+	return nil, nil, false
 }
 
 // Add inserts a new service record.
 func (s *InMemoryServiceStore) Add(svc ServiceRecord) {
+	_ = s.Create(svc)
+}
+
+// Create inserts a service record after validating its public key.
+func (s *InMemoryServiceStore) Create(svc ServiceRecord) error {
+	pub, err := validateServiceRecord(svc)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.services = append(s.services, svc)
-	s.save()
+	if s.publicKeys == nil {
+		s.publicKeys = make(map[string]*rsa.PublicKey)
+	}
+	for i := range s.services {
+		if s.services[i].ID == svc.ID {
+			return errServiceExists
+		}
+	}
+	next := append([]ServiceRecord(nil), s.services...)
+	next = append(next, svc)
+	if err := s.saveServices(next); err != nil {
+		return err
+	}
+	s.services = next
+	s.publicKeys[svc.ID] = pub
+	return nil
 }
 
 // Remove deletes a service by ID and returns true if it existed.
 func (s *InMemoryServiceStore) Remove(id string) bool {
+	return s.Delete(id) == nil
+}
+
+// Delete removes a service record and persists the new registry.
+func (s *InMemoryServiceStore) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.services {
 		if s.services[i].ID == id {
-			s.services = append(s.services[:i], s.services[i+1:]...)
-			s.save()
-			return true
+			next := append([]ServiceRecord(nil), s.services[:i]...)
+			next = append(next, s.services[i+1:]...)
+			if err := s.saveServices(next); err != nil {
+				return err
+			}
+			s.services = next
+			delete(s.publicKeys, id)
+			return nil
 		}
 	}
-	return false
+	return errServiceNotFound
 }
 
 // Update replaces all fields of an existing service. Returns an error if the
 // service does not exist.
 func (s *InMemoryServiceStore) Update(id string, svc ServiceRecord) error {
+	pub, err := validateServiceRecord(svc)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.publicKeys == nil {
+		s.publicKeys = make(map[string]*rsa.PublicKey)
+	}
 	for i := range s.services {
 		if s.services[i].ID == id {
-			s.services[i] = svc
-			s.services[i].ID = id
-			s.save()
+			next := append([]ServiceRecord(nil), s.services...)
+			next[i] = svc
+			next[i].ID = id
+			if err := s.saveServices(next); err != nil {
+				return err
+			}
+			s.services = next
+			s.publicKeys[id] = pub
 			return nil
 		}
 	}
-	return fmt.Errorf("service %s not found", id)
+	return errServiceNotFound
 }
 
 func (s *InMemoryServiceStore) load() error {
@@ -290,15 +375,66 @@ func (s *InMemoryServiceStore) load() error {
 	if err != nil {
 		return fmt.Errorf("read services file: %w", err)
 	}
-	return json.Unmarshal(data, &s.services)
+	if err := json.Unmarshal(data, &s.services); err != nil {
+		return err
+	}
+	for _, svc := range s.services {
+		pub, err := validateServiceRecord(svc)
+		if err != nil {
+			return fmt.Errorf("service %s: %w", svc.ID, err)
+		}
+		s.publicKeys[svc.ID] = pub
+	}
+	return nil
 }
 
 func (s *InMemoryServiceStore) save() {
+	_ = s.saveServices(s.services)
+}
+
+func (s *InMemoryServiceStore) saveServices(services []ServiceRecord) error {
 	if s.path == "" {
-		return
+		return nil
 	}
-	data, _ := json.MarshalIndent(s.services, "", "  ")
-	_ = os.WriteFile(s.path, data, 0644)
+	data, err := json.MarshalIndent(services, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal services: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".services-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp services file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err = tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp services file: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync temp services file: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("close temp services file: %w", err)
+	}
+	if err = os.Rename(tmpName, s.path); err != nil {
+		return fmt.Errorf("replace services file: %w", err)
+	}
+	return nil
+}
+
+func validateServiceRecord(svc ServiceRecord) (*rsa.PublicKey, error) {
+	if svc.ID == "" {
+		return nil, fmt.Errorf("id is required")
+	}
+	if strings.TrimSpace(svc.PublicKeyPEM) == "" {
+		return nil, fmt.Errorf("public_key is required")
+	}
+	pub, err := parseRSAPublicKeyPEM(svc.PublicKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("invalid public_key: %w", err)
+	}
+	return pub, nil
 }
 
 func parseRSAPublicKeyPEM(pemData string) (*rsa.PublicKey, error) {

@@ -1,10 +1,27 @@
 package config_test
 
 import (
+	"os"
 	"testing"
+	"time"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
 )
+
+func TestLoadParsesCleanupIntervalFromYAML(t *testing.T) {
+	path := t.TempDir() + "/gateway.yaml"
+	if err := os.WriteFile(path, []byte("cleanup_interval: 15m\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.CleanupInterval != 15*time.Minute {
+		t.Fatalf("expected cleanup interval 15m, got %s", cfg.CleanupInterval)
+	}
+}
 
 func TestFromLiteralLeavesDocumentServerPublicURLEmptyByDefault(t *testing.T) {
 	cfg, err := config.FromLiteral(&config.Config{
@@ -77,5 +94,37 @@ func TestFromLiteralReadsS3StorageEnvironment(t *testing.T) {
 	}
 	if cfg.S3Prefix != "documents" {
 		t.Fatalf("expected normalized prefix documents, got %q", cfg.S3Prefix)
+	}
+}
+
+func TestFromLiteralReadsCallbackQueueEnvironment(t *testing.T) {
+	t.Setenv("CALLBACK_QUEUE_SIZE", "128")
+	t.Setenv("CALLBACK_WORKERS", "8")
+
+	cfg, err := config.FromLiteral(&config.Config{
+		DocumentServerURL: "http://document-server",
+		StorageDir:        t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.CallbackQueueSize != 128 {
+		t.Fatalf("expected callback queue size 128, got %d", cfg.CallbackQueueSize)
+	}
+	if cfg.CallbackWorkers != 8 {
+		t.Fatalf("expected callback workers 8, got %d", cfg.CallbackWorkers)
+	}
+}
+
+func TestValidateRejectsMissingJWTSecret(t *testing.T) {
+	err := (&config.Config{
+		DocumentServerURL: "https://docs.example.com",
+		StorageBackend:    "local",
+		StorageDir:        t.TempDir(),
+		TTLHours:          8,
+	}).Validate()
+	if err == nil {
+		t.Fatal("expected configuration without JWT_SECRET to be rejected")
 	}
 }

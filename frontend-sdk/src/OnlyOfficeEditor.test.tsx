@@ -19,7 +19,7 @@ describe("OnlyOfficeEditor", () => {
   // S17: postMessage "onlyoffice:ready" triggers onReady
   it("calls onReady when editor posts ready message", () => {
     const onReady = vi.fn();
-    render(
+    const { container } = render(
       <OnlyOfficeEditor
         documentId="doc-123"
         gatewayUrl="https://gateway.example.com"
@@ -31,6 +31,8 @@ describe("OnlyOfficeEditor", () => {
       window.dispatchEvent(
         new MessageEvent("message", {
           data: JSON.stringify({ type: "onlyoffice:ready" }),
+          origin: "https://gateway.example.com",
+          source: container.querySelector("iframe")!.contentWindow,
         })
       );
     });
@@ -38,11 +40,24 @@ describe("OnlyOfficeEditor", () => {
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
+  it("ignores messages not sent by its editor iframe", () => {
+    const onReady = vi.fn();
+    render(<OnlyOfficeEditor documentId="doc-123" gatewayUrl="https://gateway.example.com" onReady={onReady} />);
+    act(() => {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: JSON.stringify({ type: "onlyoffice:ready" }),
+        origin: "https://gateway.example.com",
+        source: window,
+      }));
+    });
+    expect(onReady).not.toHaveBeenCalled();
+  });
+
   // S18: postMessage "onlyoffice:saved" triggers onSaved
   it("calls onSaved when editor posts saved message", () => {
     const onSaved = vi.fn();
     const eventData = { key: "doc-123", status: 2 };
-    render(
+    const { container } = render(
       <OnlyOfficeEditor
         documentId="doc-123"
         gatewayUrl="https://gateway.example.com"
@@ -54,6 +69,8 @@ describe("OnlyOfficeEditor", () => {
       window.dispatchEvent(
         new MessageEvent("message", {
           data: JSON.stringify({ type: "onlyoffice:saved", data: eventData }),
+          origin: "https://gateway.example.com",
+          source: container.querySelector("iframe")!.contentWindow,
         })
       );
     });
@@ -65,7 +82,7 @@ describe("OnlyOfficeEditor", () => {
   it("calls onError when editor posts error message", () => {
     const onError = vi.fn();
     const errData = { message: "failed to load" };
-    render(
+    const { container } = render(
       <OnlyOfficeEditor
         documentId="doc-123"
         gatewayUrl="https://gateway.example.com"
@@ -77,6 +94,8 @@ describe("OnlyOfficeEditor", () => {
       window.dispatchEvent(
         new MessageEvent("message", {
           data: JSON.stringify({ type: "onlyoffice:error", data: errData }),
+          origin: "https://gateway.example.com",
+          source: container.querySelector("iframe")!.contentWindow,
         })
       );
     });

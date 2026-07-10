@@ -19,12 +19,12 @@ func TestServiceStorePersistsAcrossRestarts(t *testing.T) {
 	}
 	store1.Add(admin.ServiceRecord{
 		ID:                    "svc-a",
-		PublicKeyPEM:          "-----BEGIN PUBLIC KEY-----\nkey-a\n-----END PUBLIC KEY-----",
+		PublicKeyPEM:          validPublicKeyPEM(t),
 		AllowedWebhookDomains: []string{"a.example.com"},
 	})
 	store1.Add(admin.ServiceRecord{
 		ID:                    "svc-b",
-		PublicKeyPEM:          "-----BEGIN PUBLIC KEY-----\nkey-b\n-----END PUBLIC KEY-----",
+		PublicKeyPEM:          validPublicKeyPEM(t),
 		AllowedWebhookDomains: []string{"b.example.com"},
 	})
 
@@ -53,8 +53,8 @@ func TestServiceStoreRemovePersists(t *testing.T) {
 	path := filepath.Join(dir, "services.json")
 
 	store1, _ := admin.NewPersistentServiceStore(path)
-	store1.Add(admin.ServiceRecord{ID: "svc-a", PublicKeyPEM: "pub-a"})
-	store1.Add(admin.ServiceRecord{ID: "svc-b", PublicKeyPEM: "pub-b"})
+	store1.Add(admin.ServiceRecord{ID: "svc-a", PublicKeyPEM: validPublicKeyPEM(t)})
+	store1.Add(admin.ServiceRecord{ID: "svc-b", PublicKeyPEM: validPublicKeyPEM(t)})
 	store1.Remove("svc-a")
 
 	// Reload

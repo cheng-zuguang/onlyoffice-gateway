@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"html"
 	"net/http"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
@@ -71,13 +72,18 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		overrides, _ = meta.ConfigOverrides.(map[string]interface{})
 	}
 
+	downloadURL := h.serverURL + "/download/" + documentID
+	if meta.SourceURL != "" {
+		downloadURL = meta.SourceURL
+	}
+
 	// Build the ONLYOFFICE config using the config builder
 	builder := configbuilder.New(configbuilder.Params{
 		DocumentServerURL: h.cfg.DocumentServerURL,
-		CallbackURL:       h.serverURL + "/callback",
-		DownloadURL:       h.serverURL + "/download/" + documentID,
+		CallbackURL:       h.serverURL + "/callback?token=" + callbackCapability(documentID, h.cfg.JWTSecret),
+		DownloadURL:       downloadURL,
 		FileType:          meta.FileType,
-		Key:               meta.EditorKey,
+		Key:               documentID,
 		Title:             meta.FileName,
 		DocumentType:      meta.DocumentType,
 		Mode:              mode,
@@ -127,11 +133,12 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 </script>
 </body>
 </html>`,
-		meta.FileName,
+		html.EscapeString(meta.FileName),
 		documentServerBrowserURL,
 		string(configJSON),
 	)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Write([]byte(html))
 }

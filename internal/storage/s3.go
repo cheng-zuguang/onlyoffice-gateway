@@ -98,6 +98,22 @@ func (s *S3Store) Put(ctx context.Context, documentID string, reader io.Reader, 
 	return s.putObject(ctx, s.objectKey(documentID, "meta.json"), bytes.NewReader(data), "application/json")
 }
 
+func (s *S3Store) Create(ctx context.Context, documentID string, meta Meta) error {
+	return s.writeMeta(ctx, documentID, &meta)
+}
+
+func (s *S3Store) Stat(ctx context.Context, documentID string, variant Variant) (*Meta, *ObjectInfo, error) {
+	meta, err := s.GetMeta(ctx, documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	_, head, err := s.objectForVariant(ctx, documentID, variant)
+	if err != nil {
+		return nil, nil, err
+	}
+	return meta, objectInfoFromHead(head), nil
+}
+
 func (s *S3Store) Open(ctx context.Context, documentID string, variant Variant, byteRange *ByteRange) (io.ReadCloser, *Meta, *ObjectInfo, error) {
 	meta, err := s.GetMeta(ctx, documentID)
 	if err != nil {
@@ -201,12 +217,19 @@ func (s *S3Store) Delete(ctx context.Context, documentID string) error {
 	if len(objects) == 0 {
 		return nil
 	}
-	_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(s.bucket),
-		Delete: &types.Delete{Objects: objects},
-	})
-	if err != nil {
-		return fmt.Errorf("delete s3 document objects: %w", err)
+	for len(objects) > 0 {
+		batchSize := 1000
+		if len(objects) < batchSize {
+			batchSize = len(objects)
+		}
+		_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			Delete: &types.Delete{Objects: objects[:batchSize]},
+		})
+		if err != nil {
+			return fmt.Errorf("delete s3 document objects: %w", err)
+		}
+		objects = objects[batchSize:]
 	}
 	return nil
 }

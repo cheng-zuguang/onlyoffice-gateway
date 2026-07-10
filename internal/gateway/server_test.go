@@ -3,16 +3,21 @@ package gateway_test
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -61,6 +66,10 @@ func signUploadJWT(t *testing.T, privateKeyPEM string, claims jwt.MapClaims) str
 }
 
 func setupGateway(t *testing.T, privPEM, pubPEM string, whitelist []string) (*httptest.Server, string, *admin.InMemoryServiceStore) {
+	return setupGatewayWithMaxUploadBytes(t, privPEM, pubPEM, whitelist, 100<<20)
+}
+
+func setupGatewayWithMaxUploadBytes(t *testing.T, privPEM, pubPEM string, whitelist []string, maxUploadBytes int64) (*httptest.Server, string, *admin.InMemoryServiceStore) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	storageDir := filepath.Join(tmpDir, "storage")
@@ -70,6 +79,7 @@ func setupGateway(t *testing.T, privPEM, pubPEM string, whitelist []string) (*ht
 		DocumentServerURL: "https://doc.example.com",
 		JWTSecret:         "test-gateway-jwt-secret",
 		StorageDir:        storageDir,
+		MaxUploadBytes:    maxUploadBytes,
 		TTLHours:          8,
 		WebhookMaxRetries: 3,
 	}
@@ -86,6 +96,12 @@ func setupGateway(t *testing.T, privPEM, pubPEM string, whitelist []string) (*ht
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	return server, storageDir, store
+}
+
+func callbackURL(serverURL, documentID string) string {
+	mac := hmac.New(sha256.New, []byte("test-gateway-jwt-secret"))
+	mac.Write([]byte("callback:" + documentID))
+	return serverURL + "/callback?token=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 // Tracer Bullet: business service uploads a document with valid JWT,
@@ -148,6 +164,211 @@ func TestUploadDocument(t *testing.T) {
 	}
 	if string(downloaded) != "fake-docx-content" {
 		t.Fatalf("expected original content, got %q", string(downloaded))
+	}
+}
+
+func TestCreateDocumentFromSignedSourceURLWithoutUploadingBytes(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	sourceURL := "https://bucket.s3.example.com/report.docx?X-Amz-Signature=abc"
+	token := signUploadJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "webhook_url": "https://test.example.com/callback",
+		"source_url": sourceURL, "file_name": "report.docx", "document_type": "word",
+		"exp": time.Now().Add(time.Minute).Unix(),
+	})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create direct document: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+	var result struct {
+		DocumentID string `json:"document_id"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&result)
+	if _, err := os.Stat(filepath.Join(storageDir, result.DocumentID, "original")); !os.IsNotExist(err) {
+		t.Fatalf("direct source must not write an original file, err=%v", err)
+	}
+	editToken := signJWT(t, privPEM, jwt.MapClaims{"service_id": "test-service", "document_id": result.DocumentID, "exp": time.Now().Add(time.Minute).Unix()})
+	editResp, err := http.Get(server.URL + "/edit?token=" + editToken)
+	if err != nil {
+		t.Fatalf("open editor: %v", err)
+	}
+	defer editResp.Body.Close()
+	editorHTML, _ := io.ReadAll(editResp.Body)
+	if !strings.Contains(string(editorHTML), sourceURL) {
+		t.Fatal("editor config must use the signed source URL directly")
+	}
+}
+
+func TestDirectSourceRejectsNonHTTPSURL(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	token := signUploadJWT(t, privPEM, jwt.MapClaims{"service_id": "test-service", "webhook_url": "https://test.example.com/callback", "source_url": "http://127.0.0.1/private", "document_type": "word", "exp": time.Now().Add(time.Minute).Unix()})
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, _ := http.DefaultClient.Do(req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestDirectSourceCallbackForwardsEditedURLWithoutDownloading(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+
+	editedURLRequested := make(chan struct{}, 1)
+	editedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		editedURLRequested <- struct{}{}
+		w.Write([]byte("gateway-must-not-download-this"))
+	}))
+	defer editedServer.Close()
+
+	webhookPayloads := make(chan map[string]interface{}, 1)
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode webhook payload: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		webhookPayloads <- payload
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhookServer.Close()
+
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"127.0.0.1"})
+	sourceURL := "https://bucket.s3.example.com/report.docx?X-Amz-Signature=abc"
+	token := signUploadJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "webhook_url": webhookServer.URL + "/callback",
+		"source_url": sourceURL, "file_name": "report.docx", "document_type": "word",
+		"external_id": "business-doc-7",
+		"exp":         time.Now().Add(time.Minute).Unix(),
+	})
+	createReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", nil)
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("create direct document: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("expected 201, got %d: %s", createResp.StatusCode, string(body))
+	}
+	var created struct {
+		DocumentID string `json:"document_id"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	callbackBody := bytes.NewReader(toJSON(map[string]interface{}{
+		"status": 2,
+		"key":    created.DocumentID,
+		"url":    editedServer.URL + "/onlyoffice-cache/report.docx",
+	}))
+	callbackReq, _ := http.NewRequest(http.MethodPost, callbackURL(server.URL, created.DocumentID), callbackBody)
+	callbackReq.Header.Set("Content-Type", "application/json")
+	callbackResp, err := http.DefaultClient.Do(callbackReq)
+	if err != nil {
+		t.Fatalf("post callback: %v", err)
+	}
+	defer callbackResp.Body.Close()
+	if callbackResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected callback 200, got %d", callbackResp.StatusCode)
+	}
+
+	select {
+	case payload := <-webhookPayloads:
+		if payload["edited_url"] != editedServer.URL+"/onlyoffice-cache/report.docx" {
+			t.Fatalf("expected edited_url to be forwarded, got %#v", payload["edited_url"])
+		}
+		if payload["external_id"] != "business-doc-7" {
+			t.Fatalf("expected external_id to be preserved, got %#v", payload["external_id"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected business webhook to receive edited_url")
+	}
+
+	select {
+	case <-editedURLRequested:
+		t.Fatal("direct source mode must not download the edited URL")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestUploadRejectsOversizedRequestWithoutPersistingDocument(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, storageDir, _ := setupGatewayWithMaxUploadBytes(t, privPEM, pubPEM, []string{"test.example.com"}, 32)
+
+	token := signUploadJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "webhook_url": "https://test.example.com/callback",
+		"file_name": "large.docx", "document_type": "word",
+		"exp": time.Now().Add(time.Minute).Unix(),
+	})
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, _ := form.CreateFormFile("file", "large.docx")
+	_, _ = io.WriteString(part, "this document exceeds the configured limit")
+	_ = form.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized upload, got %d", resp.StatusCode)
+	}
+	entries, err := os.ReadDir(storageDir)
+	if err != nil {
+		t.Fatalf("read storage directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("oversized upload must not persist documents, got %d entries", len(entries))
+	}
+}
+
+func TestUploadRejectsUnsupportedDocumentTypeWithoutPersistingDocument(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, storageDir, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	token := signUploadJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "webhook_url": "https://test.example.com/callback",
+		"file_name": "unsafe.bin", "document_type": "archive",
+		"exp": time.Now().Add(time.Minute).Unix(),
+	})
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, _ := form.CreateFormFile("file", "unsafe.bin")
+	_, _ = io.WriteString(part, "not a document")
+	_ = form.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unsupported document type, got %d", resp.StatusCode)
+	}
+	entries, err := os.ReadDir(storageDir)
+	if err != nil {
+		t.Fatalf("read storage directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unsupported document type must not persist documents, got %d entries", len(entries))
 	}
 }
 
@@ -327,6 +548,47 @@ func TestDocumentServerDownloadServesOriginalWithCacheHeaders(t *testing.T) {
 	}
 }
 
+func TestOriginalDownloadFormatsUntrustedFilenameAsOneParameter(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	fileName := `report"; filename=attacker.txt`
+	token := signUploadJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "webhook_url": "https://test.example.com/callback",
+		"file_name": fileName, "document_type": "word",
+		"exp": time.Now().Add(time.Minute).Unix(),
+	})
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, _ := form.CreateFormFile("file", "report.docx")
+	_, _ = io.WriteString(part, "document")
+	_ = form.Close()
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", &body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	uploadResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer uploadResp.Body.Close()
+	var uploaded struct {
+		DocumentID string `json:"document_id"`
+	}
+	_ = json.NewDecoder(uploadResp.Body).Decode(&uploaded)
+
+	downloadResp, err := http.Get(server.URL + "/download/" + uploaded.DocumentID)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	disposition, params, err := mime.ParseMediaType(downloadResp.Header.Get("Content-Disposition"))
+	if err != nil {
+		t.Fatalf("content disposition must be parseable: %v", err)
+	}
+	if disposition != "inline" || params["filename"] != fileName {
+		t.Fatalf("expected one inline filename parameter %q, got %q %v", fileName, disposition, params)
+	}
+}
+
 func TestDocumentServerDownloadSupportsByteRanges(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
 	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
@@ -401,7 +663,7 @@ func saveEditedViaCallback(t *testing.T, serverURL, documentID, content string) 
 		"key":    documentID,
 		"url":    fakeDocServer.URL + "/cached-file.docx",
 	}))
-	req, _ := http.NewRequest("POST", serverURL+"/callback", callbackBody)
+	req, _ := http.NewRequest("POST", callbackURL(serverURL, documentID), callbackBody)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
@@ -429,7 +691,7 @@ func TestOOCallbackSavesDocument(t *testing.T) {
 		"key":    docID,
 		"url":    fakeDocServer.URL + "/cached-file.docx",
 	}))
-	req, _ := http.NewRequest("POST", server.URL+"/callback", callbackBody)
+	req, _ := http.NewRequest("POST", callbackURL(server.URL, docID), callbackBody)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
@@ -454,6 +716,111 @@ func TestOOCallbackSavesDocument(t *testing.T) {
 	}
 }
 
+func TestOOCallbackDoesNotMarkEditedWhenDownloadFails(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	failingDocServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("temporary onlyoffice cache failure"))
+	}))
+	defer failingDocServer.Close()
+
+	callbackReq, _ := http.NewRequest(http.MethodPost, callbackURL(server.URL, docID), bytes.NewReader(toJSON(map[string]interface{}{
+		"status": 2,
+		"key":    docID,
+		"url":    failingDocServer.URL + "/cached-file.docx",
+	})))
+	callbackReq.Header.Set("Content-Type", "application/json")
+	callbackResp, err := http.DefaultClient.Do(callbackReq)
+	if err != nil {
+		t.Fatalf("post callback: %v", err)
+	}
+	defer callbackResp.Body.Close()
+	if callbackResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected callback 200, got %d", callbackResp.StatusCode)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	downloadResp, err := http.Get(server.URL + "/api/v1/documents/" + docID)
+	if err != nil {
+		t.Fatalf("download latest document: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(downloadResp.Body)
+		t.Fatalf("failed callback must leave document editing, got %d: %s", downloadResp.StatusCode, string(body))
+	}
+
+	metricsResp, err := http.Get(server.URL + "/api/v1/metrics")
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	defer metricsResp.Body.Close()
+	metricsBody, _ := io.ReadAll(metricsResp.Body)
+	if !strings.Contains(string(metricsBody), "onlyoffice_gateway_callback_save_failed_total 1") {
+		t.Fatalf("expected failed save metric, got:\n%s", string(metricsBody))
+	}
+}
+
+func TestMetricsUsePrometheusCounterMetadata(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/api/v1/metrics")
+	if err != nil {
+		t.Fatalf("get metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	metrics := string(body)
+	if !strings.Contains(metrics, "# HELP onlyoffice_gateway_callback_save_queued_total") ||
+		!strings.Contains(metrics, "# TYPE onlyoffice_gateway_callback_save_queued_total counter") {
+		t.Fatalf("expected Prometheus HELP and TYPE metadata, got:\n%s", metrics)
+	}
+}
+
+// An unauthenticated callback must not make the gateway fetch an attacker URL.
+func TestCallbackRejectsRequestWithoutCapabilityBeforeDownloading(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+
+	downloaded := make(chan struct{}, 1)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloaded <- struct{}{}
+		w.Write([]byte("attacker-controlled-content"))
+	}))
+	defer attacker.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/callback", bytes.NewReader(toJSON(map[string]interface{}{
+		"status": 2,
+		"key":    docID,
+		"url":    attacker.URL + "/file.docx",
+	})))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post callback: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated callback to return 401, got %d", resp.StatusCode)
+	}
+	select {
+	case <-downloaded:
+		t.Fatal("unauthenticated callback must not download the supplied URL")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 func toJSON(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
@@ -475,7 +842,7 @@ func TestOOCallbackDebounce(t *testing.T) {
 		body := bytes.NewReader(toJSON(map[string]interface{}{
 			"status": 2, "key": docID, "url": fakeServer.URL + "/file.docx",
 		}))
-		req, _ := http.NewRequest("POST", server.URL+"/callback", body)
+		req, _ := http.NewRequest("POST", callbackURL(server.URL, docID), body)
 		req.Header.Set("Content-Type", "application/json")
 		http.DefaultClient.Do(req)
 	}
@@ -505,7 +872,7 @@ func TestTTLExtendOnEditing(t *testing.T) {
 	body := bytes.NewReader(toJSON(map[string]interface{}{
 		"status": 1, "key": docID, "users": []string{"user-1"},
 	}))
-	req, _ := http.NewRequest("POST", server.URL+"/callback", body)
+	req, _ := http.NewRequest("POST", callbackURL(server.URL, docID), body)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
@@ -551,7 +918,7 @@ func TestWebhookRetriesThenGivesUp(t *testing.T) {
 	body := bytes.NewReader(toJSON(map[string]interface{}{
 		"status": 2, "key": docID, "url": editedServer.URL + "/file.docx",
 	}))
-	req, _ := http.NewRequest("POST", server.URL+"/callback", body)
+	req, _ := http.NewRequest("POST", callbackURL(server.URL, docID), body)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
@@ -589,6 +956,9 @@ func TestEditorPageReturnsHTML(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
+	if got := resp.Header.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("expected editor response to disable referrers, got %q", got)
+	}
 
 	html, _ := io.ReadAll(resp.Body)
 	htmlStr := string(html)
@@ -601,6 +971,50 @@ func TestEditorPageReturnsHTML(t *testing.T) {
 	}
 	if !contains(htmlStr, "postMessage") {
 		t.Fatalf("expected editor page to contain postMessage, got: %s", truncate(htmlStr, 300))
+	}
+}
+
+func TestEditorEscapesUntrustedDocumentTitle(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com"})
+	maliciousName := `</title><script>window.injected=true</script>`
+	uploadToken := signUploadJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "webhook_url": "https://test.example.com/callback",
+		"file_name": maliciousName, "document_type": "word",
+		"exp": time.Now().Add(time.Minute).Unix(),
+	})
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, _ := form.CreateFormFile("file", "document.docx")
+	_, _ = io.WriteString(part, "document")
+	_ = form.Close()
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", &body)
+	req.Header.Set("Authorization", "Bearer "+uploadToken)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	uploadResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer uploadResp.Body.Close()
+	var uploaded struct {
+		DocumentID string `json:"document_id"`
+	}
+	if err := json.NewDecoder(uploadResp.Body).Decode(&uploaded); err != nil {
+		t.Fatalf("decode upload response: %v", err)
+	}
+
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id": "test-service", "document_id": uploaded.DocumentID,
+		"exp": time.Now().Add(time.Minute).Unix(),
+	})
+	editResp, err := http.Get(server.URL + "/edit?token=" + editToken)
+	if err != nil {
+		t.Fatalf("open editor: %v", err)
+	}
+	defer editResp.Body.Close()
+	html, _ := io.ReadAll(editResp.Body)
+	if strings.Contains(string(html), maliciousName) {
+		t.Fatalf("editor page rendered unescaped document title: %s", maliciousName)
 	}
 }
 
@@ -664,6 +1078,57 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 	}
 }
 
+func TestExpiredDocumentsAreCleanedAutomatically(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+
+	tmpDir := t.TempDir()
+	storageDir := filepath.Join(tmpDir, "storage")
+	cfg := &config.Config{
+		ListenAddr:        "127.0.0.1:18080",
+		DocumentServerURL: "https://doc.example.com",
+		JWTSecret:         "test-gateway-jwt-secret",
+		StorageDir:        storageDir,
+		TTLHours:          -1,
+		CleanupInterval:   20 * time.Millisecond,
+		WebhookMaxRetries: 3,
+	}
+	loaded, _ := config.FromLiteral(cfg)
+
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "test-service",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"test.example.com"},
+	})
+
+	server := httptest.NewServer(gateway.NewHandler(loaded, store))
+	t.Cleanup(server.Close)
+
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", "https://test.example.com/callback")
+	editToken := signJWT(t, privPEM, jwt.MapClaims{
+		"service_id":  "test-service",
+		"document_id": docID,
+		"exp":         time.Now().Add(30 * time.Minute).Unix(),
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+"/edit?token="+editToken, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("open editor: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected automatic cleanup to remove expired document, last status %d", resp.StatusCode)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -702,7 +1167,7 @@ func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 		body := bytes.NewReader(toJSON(map[string]interface{}{
 			"status": 2, "key": docID, "url": fakeServer.URL + "/file.docx",
 		}))
-		req, _ := http.NewRequest("POST", server.URL+"/callback", body)
+		req, _ := http.NewRequest("POST", callbackURL(server.URL, docID), body)
 		req.Header.Set("Content-Type", "application/json")
 		http.DefaultClient.Do(req)
 	}
@@ -750,7 +1215,7 @@ func TestWebhookIncludesSignature(t *testing.T) {
 	body := bytes.NewReader(toJSON(map[string]interface{}{
 		"status": 2, "key": docID, "url": editServer.URL + "/file.docx",
 	}))
-	req, _ := http.NewRequest("POST", server.URL+"/callback", body)
+	req, _ := http.NewRequest("POST", callbackURL(server.URL, docID), body)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
@@ -867,7 +1332,7 @@ func TestEditUsesForwardedPublicURLForDocumentServerCallbacks(t *testing.T) {
 	if !contains(htmlStr, `"url":"https://doc-gateway.codeshell.cc/download/`+docID+`"`) {
 		t.Fatalf("expected forwarded https download url, got: %s", truncate(htmlStr, 800))
 	}
-	if !contains(htmlStr, `"callbackUrl":"https://doc-gateway.codeshell.cc/callback"`) {
+	if !contains(htmlStr, `"callbackUrl":"https://doc-gateway.codeshell.cc/callback?token=`) {
 		t.Fatalf("expected forwarded https callback url, got: %s", truncate(htmlStr, 800))
 	}
 	if contains(htmlStr, `http://doc-gateway.codeshell.cc/download/`) {

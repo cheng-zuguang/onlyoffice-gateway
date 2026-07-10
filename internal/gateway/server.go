@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -26,11 +27,31 @@ type ServiceResolver interface {
 	Resolve(id string) (*rsa.PublicKey, []string, bool)
 }
 
+// Runtime owns background work started for a Gateway handler.
+type Runtime struct {
+	Handler  http.Handler
+	cancel   context.CancelFunc
+	callback *handler.CallbackHandler
+}
+
+// Close stops cleanup scheduling and drains callback saves accepted before
+// shutdown. Call it after the HTTP server has stopped accepting requests.
+func (r *Runtime) Close() {
+	r.cancel()
+	r.callback.Close()
+}
+
 func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
+	return NewRuntime(cfg, resolver).Handler
+}
+
+func NewRuntime(cfg *config.Config, resolver ServiceResolver) *Runtime {
 	store, err := storage.NewStore(context.Background(), cfg)
 	if err != nil {
 		panic("failed to create storage: " + err.Error())
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	startExpiredDocumentCleanup(ctx, cfg, store)
 
 	mux := http.NewServeMux()
 
@@ -40,7 +61,11 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 		handler.NewDownloadHandler(store).ServeHTTP(w, r)
 	})
 
-	mux.Handle("POST /callback", handler.NewCallbackHandler(store, cfg.WebhookMaxRetries, cfg.JWTSecret))
+	callbackHandler := handler.NewCallbackHandlerWithOptions(store, cfg.WebhookMaxRetries, cfg.JWTSecret, handler.CallbackOptions{
+		QueueSize: cfg.CallbackQueueSize,
+		Workers:   cfg.CallbackWorkers,
+	})
+	mux.Handle("POST /callback", callbackHandler)
 
 	mux.HandleFunc("GET /edit", func(w http.ResponseWriter, r *http.Request) {
 		editor := handler.NewEditorHandler(cfg, resolver, store, getServerURL(r))
@@ -79,18 +104,36 @@ func NewHandler(cfg *config.Config, resolver ServiceResolver) http.Handler {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	mux.HandleFunc("GET /api/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.Write([]byte(callbackHandler.MetricsText()))
+	})
+
 	registerDocumentServerProxy(mux, cfg.DocumentServerURL)
 
-	return mux
+	return &Runtime{Handler: mux, cancel: cancel, callback: callbackHandler}
+}
+
+func startExpiredDocumentCleanup(ctx context.Context, cfg *config.Config, store storage.Store) {
+	if cfg.StorageBackend != "local" || cfg.CleanupInterval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(cfg.CleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = store.Expire(ctx)
+			}
+		}
+	}()
 }
 
 func serveOriginalDocument(w http.ResponseWriter, r *http.Request, store storage.Store, docID string) {
-	meta, err := store.GetMeta(r.Context(), docID)
-	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	reader, _, info, err := store.Open(r.Context(), docID, storage.VariantOriginal, nil)
+	meta, info, err := store.Stat(r.Context(), docID, storage.VariantOriginal)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			w.WriteHeader(http.StatusNotFound)
@@ -99,8 +142,6 @@ func serveOriginalDocument(w http.ResponseWriter, r *http.Request, store storage
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	reader.Close()
-
 	etag := `"` + meta.EditorKey + `"`
 	lastModified := meta.CreatedAt.UTC()
 	if lastModified.IsZero() && info != nil {
@@ -118,7 +159,7 @@ func serveOriginalDocument(w http.ResponseWriter, r *http.Request, store storage
 		return
 	}
 
-	reader, _, info, err = store.Open(r.Context(), docID, storage.VariantOriginal, byteRange)
+	reader, _, openInfo, err := store.Open(r.Context(), docID, storage.VariantOriginal, byteRange)
 	if err != nil {
 		if errors.Is(err, storage.ErrInvalidRange) {
 			setOriginalHeaders(w, meta, info, etag, lastModified)
@@ -130,6 +171,9 @@ func serveOriginalDocument(w http.ResponseWriter, r *http.Request, store storage
 		return
 	}
 	defer reader.Close()
+	if openInfo != nil {
+		info = openInfo
+	}
 
 	setOriginalHeaders(w, meta, info, etag, lastModified)
 	if byteRange == nil {
@@ -158,7 +202,7 @@ func setOriginalHeaders(w http.ResponseWriter, meta *storage.Meta, info *storage
 		w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
 	}
 	if meta != nil && meta.FileName != "" {
-		w.Header().Set("Content-Disposition", "inline; filename="+meta.FileName)
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": meta.FileName}))
 	}
 	if info != nil && info.ContentType != "" {
 		w.Header().Set("Content-Type", info.ContentType)

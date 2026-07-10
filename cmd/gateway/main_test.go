@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -28,17 +29,9 @@ webhook_max_retries: 3
 `, storageDir)
 	os.WriteFile(configPath, []byte(cfg), 0644)
 
-	// Pre-seed the service store with a test service
-	services := []map[string]interface{}{
-		{
-			"id": "test-service",
-			"public_key": `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0TestKeyForIntegration
-TestOnlyNotARealKeyButWeJustCheckHealthEndpointWhichDoesNotNeedServices
------END PUBLIC KEY-----`,
-			"allowed_webhook_domains": []string{"test.example.com"},
-		},
-	}
+	// Health check does not require registered services; keep the registry empty
+	// so the startup test only verifies process boot and routing.
+	services := []map[string]interface{}{}
 	servicesData, _ := json.MarshalIndent(services, "", "  ")
 	os.WriteFile(servicesPath, servicesData, 0644)
 
@@ -63,6 +56,7 @@ TestOnlyNotARealKeyButWeJustCheckHealthEndpointWhichDoesNotNeedServices
 		"ADMIN_PASSWORD=admin123",
 		"STORAGE_DIR="+storageDir,
 		"TTL_HOURS=8",
+		"CLEANUP_INTERVAL=1h",
 		"WEBHOOK_MAX_RETRIES=3",
 		"HOME="+os.Getenv("HOME"),
 		"PATH="+os.Getenv("PATH"),
@@ -70,7 +64,12 @@ TestOnlyNotARealKeyButWeJustCheckHealthEndpointWhichDoesNotNeedServices
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
 
 	// Wait for server
 	var resp *http.Response
@@ -90,6 +89,12 @@ TestOnlyNotARealKeyButWeJustCheckHealthEndpointWhichDoesNotNeedServices
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("gateway did not exit gracefully: %v", err)
 	}
 }
 

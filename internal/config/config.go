@@ -6,27 +6,67 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	ListenAddr              string `yaml:"listen_addr"`
-	DocumentServerURL       string `yaml:"document_server_url"`
-	DocumentServerPublicURL string `yaml:"document_server_public_url"`
-	JWTSecret               string `yaml:"jwt_secret"`
-	StorageBackend          string `yaml:"storage_backend"`
-	StorageDir              string `yaml:"storage_dir"`
-	S3Endpoint              string `yaml:"s3_endpoint"`
-	S3Region                string `yaml:"s3_region"`
-	S3Bucket                string `yaml:"s3_bucket"`
-	S3AccessKey             string `yaml:"s3_access_key"`
-	S3SecretKey             string `yaml:"s3_secret_key"`
-	S3UsePathStyle          bool   `yaml:"s3_use_path_style"`
-	S3UseSSL                bool   `yaml:"s3_use_ssl"`
-	S3Prefix                string `yaml:"s3_prefix"`
-	TTLHours                int    `yaml:"ttl_hours"`
-	WebhookMaxRetries       int    `yaml:"webhook_max_retries"`
+	ListenAddr              string        `yaml:"listen_addr"`
+	DocumentServerURL       string        `yaml:"document_server_url"`
+	DocumentServerPublicURL string        `yaml:"document_server_public_url"`
+	JWTSecret               string        `yaml:"jwt_secret"`
+	StorageBackend          string        `yaml:"storage_backend"`
+	StorageDir              string        `yaml:"storage_dir"`
+	S3Endpoint              string        `yaml:"s3_endpoint"`
+	S3Region                string        `yaml:"s3_region"`
+	S3Bucket                string        `yaml:"s3_bucket"`
+	S3AccessKey             string        `yaml:"s3_access_key"`
+	S3SecretKey             string        `yaml:"s3_secret_key"`
+	S3UsePathStyle          bool          `yaml:"s3_use_path_style"`
+	S3UseSSL                bool          `yaml:"s3_use_ssl"`
+	S3Prefix                string        `yaml:"s3_prefix"`
+	MaxUploadBytes          int64         `yaml:"max_upload_bytes"`
+	TTLHours                int           `yaml:"ttl_hours"`
+	CleanupInterval         time.Duration `yaml:"cleanup_interval"`
+	WebhookMaxRetries       int           `yaml:"webhook_max_retries"`
+	CallbackQueueSize       int           `yaml:"callback_queue_size"`
+	CallbackWorkers         int           `yaml:"callback_workers"`
+}
+
+// UnmarshalYAML accepts the human-readable duration syntax used by environment
+// variables (for example "15m" or "1h") for cleanup_interval as well.
+func (cfg *Config) UnmarshalYAML(value *yaml.Node) error {
+	var cleanupInterval *time.Duration
+	content := make([]*yaml.Node, 0, len(value.Content))
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key, field := value.Content[i], value.Content[i+1]
+		if key.Value != "cleanup_interval" {
+			content = append(content, key, field)
+			continue
+		}
+		if field.Kind != yaml.ScalarNode {
+			return fmt.Errorf("cleanup_interval must be a duration string")
+		}
+		duration, err := time.ParseDuration(field.Value)
+		if err != nil {
+			return fmt.Errorf("cleanup_interval: %w", err)
+		}
+		cleanupInterval = &duration
+	}
+
+	type plain Config
+	decoded := plain(*cfg)
+	withoutCleanup := *value
+	withoutCleanup.Content = content
+	if err := withoutCleanup.Decode(&decoded); err != nil {
+		return err
+	}
+	*cfg = Config(decoded)
+	if cleanupInterval != nil {
+		cfg.CleanupInterval = *cleanupInterval
+	}
+	return nil
 }
 
 func Defaults() *Config {
@@ -37,8 +77,12 @@ func Defaults() *Config {
 		S3Region:          "us-east-1",
 		S3UsePathStyle:    true,
 		S3UseSSL:          true,
+		MaxUploadBytes:    100 << 20,
 		TTLHours:          8,
+		CleanupInterval:   time.Hour,
 		WebhookMaxRetries: 3,
+		CallbackQueueSize: 64,
+		CallbackWorkers:   4,
 	}
 }
 
@@ -107,14 +151,34 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 	if s := os.Getenv("S3_PREFIX"); s != "" {
 		cfg.S3Prefix = s
 	}
+	if s := os.Getenv("MAX_UPLOAD_BYTES"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			cfg.MaxUploadBytes = v
+		}
+	}
 	if s := os.Getenv("TTL_HOURS"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
 			cfg.TTLHours = v
 		}
 	}
+	if s := os.Getenv("CLEANUP_INTERVAL"); s != "" {
+		if v, err := time.ParseDuration(s); err == nil {
+			cfg.CleanupInterval = v
+		}
+	}
 	if s := os.Getenv("WEBHOOK_MAX_RETRIES"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
 			cfg.WebhookMaxRetries = v
+		}
+	}
+	if s := os.Getenv("CALLBACK_QUEUE_SIZE"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			cfg.CallbackQueueSize = v
+		}
+	}
+	if s := os.Getenv("CALLBACK_WORKERS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			cfg.CallbackWorkers = v
 		}
 	}
 
@@ -132,6 +196,18 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 	if cfg.S3Region == "" {
 		cfg.S3Region = "us-east-1"
 	}
+	if cfg.MaxUploadBytes <= 0 {
+		cfg.MaxUploadBytes = 100 << 20
+	}
+	if cfg.CleanupInterval <= 0 {
+		cfg.CleanupInterval = time.Hour
+	}
+	if cfg.CallbackQueueSize <= 0 {
+		cfg.CallbackQueueSize = 64
+	}
+	if cfg.CallbackWorkers <= 0 {
+		cfg.CallbackWorkers = 4
+	}
 	cfg.S3Endpoint = strings.TrimRight(strings.TrimSpace(cfg.S3Endpoint), "/")
 	cfg.S3Prefix = strings.Trim(strings.TrimSpace(cfg.S3Prefix), "/")
 	return cfg, nil
@@ -141,4 +217,42 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 // Config (useful for testing).
 func FromLiteral(cfg *Config) (*Config, error) {
 	return applyEnvOverrides(cfg)
+}
+
+// Validate verifies the configuration values required to safely serve requests.
+func (cfg *Config) Validate() error {
+	if strings.TrimSpace(cfg.JWTSecret) == "" {
+		return fmt.Errorf("JWT_SECRET is required")
+	}
+	if strings.TrimSpace(cfg.DocumentServerURL) == "" {
+		return fmt.Errorf("DOCUMENT_SERVER_URL is required")
+	}
+	if cfg.TTLHours <= 0 {
+		return fmt.Errorf("TTL_HOURS must be greater than zero")
+	}
+	if cfg.MaxUploadBytes <= 0 {
+		return fmt.Errorf("MAX_UPLOAD_BYTES must be greater than zero")
+	}
+	if cfg.CleanupInterval <= 0 {
+		return fmt.Errorf("CLEANUP_INTERVAL must be greater than zero")
+	}
+	if cfg.CallbackQueueSize <= 0 {
+		return fmt.Errorf("CALLBACK_QUEUE_SIZE must be greater than zero")
+	}
+	if cfg.CallbackWorkers <= 0 {
+		return fmt.Errorf("CALLBACK_WORKERS must be greater than zero")
+	}
+	switch cfg.StorageBackend {
+	case "local":
+		if strings.TrimSpace(cfg.StorageDir) == "" {
+			return fmt.Errorf("STORAGE_DIR is required for local storage")
+		}
+	case "s3":
+		if strings.TrimSpace(cfg.S3Bucket) == "" {
+			return fmt.Errorf("S3_BUCKET is required for s3 storage")
+		}
+	default:
+		return fmt.Errorf("unsupported STORAGE_BACKEND %q", cfg.StorageBackend)
+	}
+	return nil
 }

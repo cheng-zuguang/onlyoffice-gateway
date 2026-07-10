@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 interface SavedEvent {
   key: string;
@@ -30,8 +30,11 @@ export function OnlyOfficeEditor({
   onError,
   style,
 }: OnlyOfficeEditorProps) {
-  useEffect(() => {
-    const handler = (event: MessageEvent) => {
+	const iframeRef = useRef<HTMLIFrameElement>(null);
+	useEffect(() => {
+		const gatewayOrigin = new URL(gatewayUrl).origin;
+		const handler = (event: MessageEvent) => {
+			if (event.origin !== gatewayOrigin || event.source !== iframeRef.current?.contentWindow) return;
       try {
         const msg = JSON.parse(event.data);
         switch (msg.type) {
@@ -52,7 +55,7 @@ export function OnlyOfficeEditor({
 
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [onReady, onSaved, onError]);
+	}, [gatewayUrl, onReady, onSaved, onError]);
 
   const params = new URLSearchParams({ document_id: documentId });
   if (token) params.set("token", token);
@@ -60,6 +63,7 @@ export function OnlyOfficeEditor({
 
   return (
     <iframe
+		ref={iframeRef}
       src={`${gatewayUrl}/edit?${params.toString()}`}
       style={{
         width: "100%",
