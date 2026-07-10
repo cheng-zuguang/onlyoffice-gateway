@@ -43,11 +43,18 @@ dev:
 		cp .env.example .env; \
 		echo "  → Edit .env to set ADMIN_PASSWORD, JWT_SECRET, etc."; \
 	fi
-	@echo "Starting gateway on :18080..."
-	@$(MAKE) run &
-	@sleep 2
-	@echo "Starting admin UI on :5173..."
-	@$(MAKE) frontend-dev
+	@set -e; \
+		echo "Starting gateway on :18080..."; \
+		$(MAKE) run & gateway_pid=$$!; \
+		trap 'kill $$gateway_pid 2>/dev/null || true' EXIT INT TERM; \
+		sleep 2; \
+		if ! kill -0 $$gateway_pid 2>/dev/null; then \
+			wait $$gateway_pid || true; \
+			echo "Gateway failed to start; check that :18080 is available and .env is valid." >&2; \
+			exit 1; \
+		fi; \
+		echo "Starting admin UI on :5173..."; \
+		$(MAKE) frontend-dev
 
 # ── SDK ───────────────────────────────────────────────────────────────────────
 

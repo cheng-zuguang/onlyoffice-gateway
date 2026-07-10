@@ -239,6 +239,30 @@ func (s *LocalStore) Expire(ctx context.Context) (int, error) {
 	return cleaned, nil
 }
 
+func (s *LocalStore) List(ctx context.Context, query AttachmentQuery) ([]Meta, string, error) {
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, "", err
+	}
+	items := make([]Meta, 0, len(entries))
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		if !entry.IsDir() {
+			continue
+		}
+		lock := s.lockFor(entry.Name())
+		lock.RLock()
+		meta, readErr := s.readMetaLocked(entry.Name())
+		lock.RUnlock()
+		if readErr == nil {
+			items = append(items, *meta)
+		}
+	}
+	return pageAttachments(items, query)
+}
+
 func (s *LocalStore) readMetaLocked(documentID string) (*Meta, error) {
 	dir := filepath.Join(s.root, documentID)
 	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))

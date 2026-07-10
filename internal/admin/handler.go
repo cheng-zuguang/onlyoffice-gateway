@@ -8,22 +8,29 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/zenmind/onlyoffice-gateway/internal/audit"
+	"github.com/zenmind/onlyoffice-gateway/internal/storage"
 )
 
 // Opts holds dependencies for the admin mux.
 type Opts struct {
-	AdminUsername string
-	AdminPassword string
-	JWTSecret     string
-	Store         *InMemoryServiceStore
+	AdminUsername   string
+	AdminPassword   string
+	JWTSecret       string
+	Store           *InMemoryServiceStore
+	AttachmentStore storage.Store
+	AuditLog        *audit.Log
 }
 
 // NewMux returns an http.Handler mounting all admin API routes.
@@ -44,8 +51,206 @@ func NewMux(opts Opts) http.Handler {
 	mux.HandleFunc("POST /admin/api/services", protect(svc.handleCreateService))
 	mux.HandleFunc("PUT /admin/api/services/{id}", protect(svc.handleUpdateService))
 	mux.HandleFunc("DELETE /admin/api/services/{id}", protect(svc.handleDeleteService))
+	attachments := &attachmentHandler{store: opts.AttachmentStore, audit: opts.AuditLog}
+	mux.HandleFunc("GET /admin/api/attachments", protect(attachments.handleList))
+	mux.HandleFunc("GET /admin/api/attachments/{id}", protect(attachments.handleGet))
+	mux.HandleFunc("GET /admin/api/attachments/{id}/download", protect(attachments.handleDownload))
+	mux.HandleFunc("POST /admin/api/attachments/{id}/extend-ttl", protect(attachments.handleExtendTTL))
+	mux.HandleFunc("DELETE /admin/api/attachments/{id}", protect(attachments.handleDelete))
+	mux.HandleFunc("POST /admin/api/attachments/cleanup", protect(attachments.handleCleanup))
+	mux.HandleFunc("GET /admin/api/logs", protect(attachments.handleLogs))
 
 	return mux
+}
+
+// AttachmentRecord is the safe administrator representation of a temporary
+// attachment. It deliberately excludes callback and direct-source URLs.
+type AttachmentRecord struct {
+	DocumentID   string    `json:"document_id"`
+	ServiceID    string    `json:"service_id"`
+	ExternalID   string    `json:"external_id,omitempty"`
+	FileName     string    `json:"file_name"`
+	DocumentType string    `json:"document_type"`
+	CreatedAt    time.Time `json:"created_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	IsEdited     bool      `json:"is_edited"`
+	EditedAt     time.Time `json:"edited_at,omitempty"`
+	DirectSource bool      `json:"direct_source"`
+	SourceHost   string    `json:"source_host,omitempty"`
+	WebhookHost  string    `json:"webhook_host,omitempty"`
+}
+
+type attachmentHandler struct {
+	store storage.Store
+	audit *audit.Log
+}
+
+func (h *attachmentHandler) available(w http.ResponseWriter) bool {
+	if h.store == nil || h.audit == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "attachment administration unavailable"})
+		return false
+	}
+	return true
+}
+
+func (h *attachmentHandler) handleList(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, next, err := h.store.List(r.Context(), storage.AttachmentQuery{ServiceID: r.URL.Query().Get("service_id"), Cursor: r.URL.Query().Get("cursor"), Limit: limit})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid attachment query"})
+		return
+	}
+	records := make([]AttachmentRecord, 0, len(items))
+	for _, item := range items {
+		records = append(records, attachmentRecord(item))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": records, "next_cursor": next})
+}
+
+func (h *attachmentHandler) handleGet(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	meta, err := h.store.GetMeta(r.Context(), r.PathValue("id"))
+	if err != nil {
+		attachmentError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, attachmentRecord(*meta))
+}
+
+func (h *attachmentHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	id := r.PathValue("id")
+	meta, err := h.store.GetMeta(r.Context(), id)
+	if err != nil {
+		attachmentError(w, err)
+		return
+	}
+	if meta.SourceURL != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "direct-source attachment is not hosted by gateway"})
+		return
+	}
+	variant := storage.Variant(r.URL.Query().Get("variant"))
+	if variant == "" {
+		variant = storage.VariantLatest
+	}
+	if variant != storage.VariantOriginal && variant != storage.VariantLatest {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid variant"})
+		return
+	}
+	reader, _, info, err := h.store.Open(r.Context(), id, variant, nil)
+	if err != nil {
+		attachmentError(w, err)
+		return
+	}
+	defer reader.Close()
+	if err := h.audit.Write(r.Context(), audit.Event{Level: "info", Type: "admin.attachment_downloaded", DocumentID: id}); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": meta.FileName}))
+	w.Header().Set("Content-Type", info.ContentType)
+	io.Copy(w, reader)
+}
+
+func (h *attachmentHandler) handleExtendTTL(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	var body struct {
+		Hours int `json:"hours"`
+	}
+	if json.NewDecoder(r.Body).Decode(&body) != nil || body.Hours < 1 || body.Hours > 168 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "hours must be between 1 and 168"})
+		return
+	}
+	id := r.PathValue("id")
+	if err := h.audit.Write(r.Context(), audit.Event{Level: "info", Type: "admin.attachment_ttl_extended", DocumentID: id}); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	if err := h.store.ExtendTTL(r.Context(), id, body.Hours); err != nil {
+		attachmentError(w, err)
+		return
+	}
+	meta, _ := h.store.GetMeta(r.Context(), id)
+	writeJSON(w, http.StatusOK, attachmentRecord(*meta))
+}
+
+func (h *attachmentHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	var body struct {
+		Confirm bool `json:"confirm"`
+	}
+	if json.NewDecoder(r.Body).Decode(&body) != nil || !body.Confirm {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "confirm must be true"})
+		return
+	}
+	id := r.PathValue("id")
+	if err := h.audit.Write(r.Context(), audit.Event{Level: "info", Type: "admin.attachment_deleted", DocumentID: id}); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	if err := h.store.Delete(r.Context(), id); err != nil {
+		attachmentError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+}
+
+func (h *attachmentHandler) handleCleanup(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	if err := h.audit.Write(r.Context(), audit.Event{Level: "info", Type: "admin.attachments_cleanup"}); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	count, err := h.store.Expire(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cleanup failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"cleaned": count})
+}
+
+func (h *attachmentHandler) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if !h.available(w) {
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, next, err := h.audit.List(r.Context(), audit.Query{Level: r.URL.Query().Get("level"), Type: r.URL.Query().Get("type"), RequestID: r.URL.Query().Get("request_id"), DocumentID: r.URL.Query().Get("document_id"), Limit: limit, Cursor: r.URL.Query().Get("cursor")})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "read audit log"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": items, "next_cursor": next})
+}
+
+func attachmentRecord(meta storage.Meta) AttachmentRecord {
+	return AttachmentRecord{DocumentID: meta.DocumentID, ServiceID: meta.ServiceID, ExternalID: meta.ExternalID, FileName: meta.FileName, DocumentType: meta.DocumentType, CreatedAt: meta.CreatedAt, ExpiresAt: meta.ExpiresAt, IsEdited: meta.IsEdited, EditedAt: meta.EditedAt, DirectSource: meta.SourceURL != "", SourceHost: hostOf(meta.SourceURL), WebhookHost: hostOf(meta.WebhookURL)}
+}
+func hostOf(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	raw = strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://")
+	return strings.Split(strings.Split(strings.Split(raw, "/")[0], "?")[0], ":")[0]
+}
+func attachmentError(w http.ResponseWriter, err error) {
+	if errors.Is(err, os.ErrNotExist) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "attachment not found"})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "attachment storage error"})
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────

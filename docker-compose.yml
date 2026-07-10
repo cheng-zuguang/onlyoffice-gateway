@@ -72,6 +72,8 @@ services:
       ADMIN_USERNAME:      ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD:      ${ADMIN_PASSWORD:-}
       SERVICE_STORE_PATH:  /app/data/services.json
+      ADMIN_AUDIT_LOG_DIR: /app/data/audit
+      ADMIN_AUDIT_LOG_RETENTION_DAYS: ${ADMIN_AUDIT_LOG_RETENTION_DAYS:-14}
 
     ports:
       - "${GATEWAY_PORT:-18080}:18080"

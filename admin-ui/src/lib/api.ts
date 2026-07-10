@@ -54,6 +54,10 @@ export interface ApiError {
   error: string
 }
 
+export interface Attachment { document_id: string; service_id: string; external_id?: string; file_name: string; document_type: string; created_at: string; expires_at: string; is_edited: boolean; direct_source: boolean; source_host?: string }
+export interface AuditEvent { time: string; level: string; type: string; document_id?: string; request_id?: string; service_id?: string }
+export interface Page<T> { items: T[]; next_cursor: string }
+
 export async function login(username: string, password: string): Promise<LoginResponse> {
   const res = await request('POST', '/login', { username, password })
   if (!res.ok) {
@@ -102,3 +106,9 @@ export async function updateService(svc: {
   }
   return res.json()
 }
+
+export async function listAttachments(cursor = ''): Promise<Page<Attachment>> { const query = new URLSearchParams({ limit: '50' }); if (cursor) query.set('cursor', cursor); const res = await request('GET', `/attachments?${query}`); if (!res.ok) throw new Error('加载临时附件失败'); return res.json() }
+export async function deleteAttachment(id: string): Promise<void> { const res = await request('DELETE', `/attachments/${encodeURIComponent(id)}`, { confirm: true }); if (!res.ok) throw new Error('删除临时附件失败') }
+export async function extendAttachmentTTL(id: string, hours: number): Promise<void> { const res = await request('POST', `/attachments/${encodeURIComponent(id)}/extend-ttl`, { hours }); if (!res.ok) throw new Error('延长有效期失败') }
+export async function cleanupAttachments(): Promise<number> { const res = await request('POST', '/attachments/cleanup', {}); if (!res.ok) throw new Error('清理过期附件失败'); return (await res.json()).cleaned }
+export async function listAuditEvents(cursor = ''): Promise<Page<AuditEvent>> { const query = new URLSearchParams({ limit: '50' }); if (cursor) query.set('cursor', cursor); const res = await request('GET', `/logs?${query}`); if (!res.ok) throw new Error('加载运行日志失败'); return res.json() }

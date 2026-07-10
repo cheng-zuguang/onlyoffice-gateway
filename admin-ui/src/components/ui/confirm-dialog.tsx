@@ -1,46 +1,7 @@
-import { Button } from './button'
-import { X } from 'lucide-react'
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from './alert-dialog'
 
-interface ConfirmDialogProps {
-  open: boolean
-  title: string
-  message: string
-  confirmLabel?: string
-  variant?: 'default' | 'destructive'
-  onConfirm: () => void
-  onCancel: () => void
-}
+interface ConfirmDialogProps { open: boolean; title: string; message: string; confirmLabel?: string; variant?: 'default' | 'destructive'; onConfirm: () => void; onCancel: () => void }
 
-export function ConfirmDialog({
-  open,
-  title,
-  message,
-  confirmLabel = 'Delete',
-  variant = 'destructive',
-  onConfirm,
-  onCancel,
-}: ConfirmDialogProps) {
-  if (!open) return null
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-base font-semibold">{title}</h3>
-          <button onClick={onCancel} className="rounded-md p-1 hover:bg-accent">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        <p className="text-sm text-muted-foreground">{message}</p>
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button variant={variant} onClick={onConfirm}>
-            {confirmLabel}
-          </Button>
-        </div>
-      </div>
-    </div>
-  )
+export function ConfirmDialog({ open, title, message, confirmLabel = '删除', variant = 'destructive', onConfirm, onCancel }: ConfirmDialogProps) {
+  return <AlertDialog open={open} onOpenChange={(next) => !next && onCancel()}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{title}</AlertDialogTitle><AlertDialogDescription>{message}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel onClick={onCancel}>取消</AlertDialogCancel><AlertDialogAction variant={variant} onClick={onConfirm}>{confirmLabel}</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
 }

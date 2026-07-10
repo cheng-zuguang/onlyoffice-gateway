@@ -30,6 +30,7 @@ type ServiceResolver interface {
 // Runtime owns background work started for a Gateway handler.
 type Runtime struct {
 	Handler  http.Handler
+	Store    storage.Store
 	cancel   context.CancelFunc
 	callback *handler.CallbackHandler
 }
@@ -111,11 +112,11 @@ func NewRuntime(cfg *config.Config, resolver ServiceResolver) *Runtime {
 
 	registerDocumentServerProxy(mux, cfg.DocumentServerURL)
 
-	return &Runtime{Handler: mux, cancel: cancel, callback: callbackHandler}
+	return &Runtime{Handler: mux, Store: store, cancel: cancel, callback: callbackHandler}
 }
 
 func startExpiredDocumentCleanup(ctx context.Context, cfg *config.Config, store storage.Store) {
-	if cfg.StorageBackend != "local" || cfg.CleanupInterval <= 0 {
+	if cfg.CleanupInterval <= 0 {
 		return
 	}
 	go func() {

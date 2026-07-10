@@ -46,6 +46,14 @@ type ObjectInfo struct {
 	ContentType  string
 }
 
+// AttachmentQuery limits the temporary attachments returned to an administrator.
+// Cursor is opaque and is returned by List when more records are available.
+type AttachmentQuery struct {
+	ServiceID string
+	Cursor    string
+	Limit     int
+}
+
 type Store interface {
 	Put(ctx context.Context, documentID string, reader io.Reader, meta Meta) error
 	Create(ctx context.Context, documentID string, meta Meta) error
@@ -57,4 +65,5 @@ type Store interface {
 	ExtendTTL(ctx context.Context, documentID string, hours int) error
 	Delete(ctx context.Context, documentID string) error
 	Expire(ctx context.Context) (int, error)
+	List(ctx context.Context, query AttachmentQuery) ([]Meta, string, error)
 }

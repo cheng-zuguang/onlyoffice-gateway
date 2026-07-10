@@ -119,6 +119,51 @@ func TestStoreContractExpireDeletesExpiredDocuments(t *testing.T) {
 	})
 }
 
+func TestStoreContractListsTemporaryAttachmentsNewestFirst(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		store Store
+	}{
+		{"local", mustNewLocalStore(t)},
+		{"s3", NewS3StoreWithClient(newFakeS3Client(), "bucket", "documents")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			older := Meta{DocumentID: "doc-older", ServiceID: "service-a", CreatedAt: time.Now().Add(-time.Hour), ExpiresAt: time.Now().Add(time.Hour)}
+			newer := Meta{DocumentID: "doc-newer", ServiceID: "service-a", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+			if err := test.store.Put(ctx, older.DocumentID, strings.NewReader("old"), older); err != nil {
+				t.Fatalf("put older attachment: %v", err)
+			}
+			if err := test.store.Put(ctx, newer.DocumentID, strings.NewReader("new"), newer); err != nil {
+				t.Fatalf("put newer attachment: %v", err)
+			}
+
+			attachments, next, err := test.store.List(ctx, AttachmentQuery{ServiceID: "service-a", Limit: 1})
+			if err != nil {
+				t.Fatalf("list attachments: %v", err)
+			}
+			if len(attachments) != 1 || attachments[0].DocumentID != newer.DocumentID {
+				t.Fatalf("expected newest attachment first, got %#v", attachments)
+			}
+			if next == "" {
+				t.Fatal("expected a cursor for the remaining attachment")
+			}
+			secondPage, finalCursor, err := test.store.List(ctx, AttachmentQuery{ServiceID: "service-a", Limit: 1, Cursor: next})
+			if err != nil { t.Fatalf("list next attachment page: %v", err) }
+			if len(secondPage) != 1 || secondPage[0].DocumentID != older.DocumentID || finalCursor != "" { t.Fatalf("expected final older attachment page, got %#v next=%q", secondPage, finalCursor) }
+		})
+	}
+}
+
+func mustNewLocalStore(t *testing.T) Store {
+	t.Helper()
+	store, err := NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local store: %v", err)
+	}
+	return store
+}
+
 func runExpireContract(t *testing.T, store Store) {
 	t.Helper()
 	ctx := context.Background()

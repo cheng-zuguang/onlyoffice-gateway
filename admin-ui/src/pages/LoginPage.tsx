@@ -36,31 +36,29 @@ export default function LoginPage() {
             <Key className="h-6 w-6 text-primary-foreground" />
           </div>
           <h1 className="text-2xl font-semibold tracking-tight">Gateway Admin</h1>
-          <p className="text-sm text-muted-foreground">
-            Sign in to manage your services
-          </p>
+          <p className="text-sm text-muted-foreground">登录后管理业务服务</p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="username">Username</Label>
+            <Label htmlFor="username">用户名</Label>
             <Input
               id="username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="please enter your username"
+              placeholder="请输入用户名"
               required
               autoFocus
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="password">Password</Label>
+            <Label htmlFor="password">密码</Label>
             <Input
               id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="please enter your password"
+              placeholder="请输入密码"
               required
             />
           </div>
@@ -70,7 +68,7 @@ export default function LoginPage() {
             </div>
           )}
           <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? 'Signing in...' : 'Sign in'}
+            {loading ? '登录中...' : '登录'}
           </Button>
         </form>
       </div>

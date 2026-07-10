@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/zenmind/onlyoffice-gateway/internal/audit"
 )
 
 // responseWriter wraps http.ResponseWriter to capture the status code.
@@ -12,6 +14,16 @@ type responseWriter struct {
 	http.ResponseWriter
 	statusCode  int
 	wroteHeader bool
+}
+
+// AuditMiddleware intentionally does not persist generic HTTP access events.
+// The audit stream is reserved for actionable business and administrator events;
+// stdout LoggingMiddleware remains the access-log sink.
+func AuditMiddleware(next http.Handler, sink *audit.Log) http.Handler {
+	_ = sink
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (rw *responseWriter) WriteHeader(code int) {

@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/admin"
+	"github.com/zenmind/onlyoffice-gateway/internal/audit"
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
 	"github.com/zenmind/onlyoffice-gateway/internal/gateway"
 	"github.com/zenmind/onlyoffice-gateway/internal/version"
@@ -100,18 +102,32 @@ func newRootHandler(cfg *config.Config, serviceStore *admin.InMemoryServiceStore
 
 func newRootRuntime(cfg *config.Config, serviceStore *admin.InMemoryServiceStore, adminUser, adminPass string) (http.Handler, func()) {
 	gwRuntime := gateway.NewRuntime(cfg, serviceStore)
+	auditDir := cfg.AdminAuditLogDir
+	if auditDir == "" {
+		auditDir = filepath.Join(cfg.StorageDir, "audit")
+	}
+	retentionDays := cfg.AdminAuditRetentionDays
+	if retentionDays == 0 {
+		retentionDays = 14
+	}
+	auditLog, err := audit.New(auditDir, retentionDays, cfg.ListenAddr)
+	if err != nil {
+		panic("failed to create audit log: " + err.Error())
+	}
 	adminMux := admin.NewMux(admin.Opts{
-		AdminUsername: adminUser,
-		AdminPassword: adminPass,
-		JWTSecret:     cfg.JWTSecret,
-		Store:         serviceStore,
+		AdminUsername:   adminUser,
+		AdminPassword:   adminPass,
+		JWTSecret:       cfg.JWTSecret,
+		Store:           serviceStore,
+		AttachmentStore: gwRuntime.Store,
+		AuditLog:        auditLog,
 	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/admin/api/", adminMux)
 	mux.Handle("/", gwRuntime.Handler)
 
-	return gateway.LoggingMiddleware(mux), gwRuntime.Close
+	return gateway.LoggingMiddleware(gateway.AuditMiddleware(mux, auditLog)), gwRuntime.Close
 }
 
 func loadDotEnv(path string) {

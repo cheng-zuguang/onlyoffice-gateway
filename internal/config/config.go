@@ -32,6 +32,8 @@ type Config struct {
 	WebhookMaxRetries       int           `yaml:"webhook_max_retries"`
 	CallbackQueueSize       int           `yaml:"callback_queue_size"`
 	CallbackWorkers         int           `yaml:"callback_workers"`
+	AdminAuditLogDir        string        `yaml:"admin_audit_log_dir"`
+	AdminAuditRetentionDays int           `yaml:"admin_audit_log_retention_days"`
 }
 
 // UnmarshalYAML accepts the human-readable duration syntax used by environment
@@ -71,18 +73,20 @@ func (cfg *Config) UnmarshalYAML(value *yaml.Node) error {
 
 func Defaults() *Config {
 	return &Config{
-		ListenAddr:        ":18080",
-		StorageBackend:    "local",
-		StorageDir:        "./data/storage",
-		S3Region:          "us-east-1",
-		S3UsePathStyle:    true,
-		S3UseSSL:          true,
-		MaxUploadBytes:    100 << 20,
-		TTLHours:          8,
-		CleanupInterval:   time.Hour,
-		WebhookMaxRetries: 3,
-		CallbackQueueSize: 64,
-		CallbackWorkers:   4,
+		ListenAddr:              ":18080",
+		StorageBackend:          "local",
+		StorageDir:              "./data/storage",
+		S3Region:                "us-east-1",
+		S3UsePathStyle:          true,
+		S3UseSSL:                true,
+		MaxUploadBytes:          100 << 20,
+		TTLHours:                8,
+		CleanupInterval:         time.Hour,
+		WebhookMaxRetries:       3,
+		CallbackQueueSize:       64,
+		CallbackWorkers:         4,
+		AdminAuditLogDir:        "./data/audit",
+		AdminAuditRetentionDays: 14,
 	}
 }
 
@@ -181,11 +185,23 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 			cfg.CallbackWorkers = v
 		}
 	}
+	if s := os.Getenv("ADMIN_AUDIT_LOG_DIR"); s != "" {
+		cfg.AdminAuditLogDir = s
+	}
+	if s := os.Getenv("ADMIN_AUDIT_LOG_RETENTION_DAYS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			cfg.AdminAuditRetentionDays = v
+		}
+	}
 
 	var err error
 	cfg.StorageDir, err = filepath.Abs(cfg.StorageDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage dir: %w", err)
+	}
+	cfg.AdminAuditLogDir, err = filepath.Abs(cfg.AdminAuditLogDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve audit log dir: %w", err)
 	}
 	cfg.DocumentServerURL = strings.TrimRight(cfg.DocumentServerURL, "/")
 	cfg.DocumentServerPublicURL = strings.TrimRight(cfg.DocumentServerPublicURL, "/")
@@ -207,6 +223,9 @@ func applyEnvOverrides(cfg *Config) (*Config, error) {
 	}
 	if cfg.CallbackWorkers <= 0 {
 		cfg.CallbackWorkers = 4
+	}
+	if cfg.AdminAuditRetentionDays <= 0 {
+		cfg.AdminAuditRetentionDays = 14
 	}
 	cfg.S3Endpoint = strings.TrimRight(strings.TrimSpace(cfg.S3Endpoint), "/")
 	cfg.S3Prefix = strings.Trim(strings.TrimSpace(cfg.S3Prefix), "/")
@@ -241,6 +260,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.CallbackWorkers <= 0 {
 		return fmt.Errorf("CALLBACK_WORKERS must be greater than zero")
+	}
+	if cfg.AdminAuditRetentionDays < 1 || cfg.AdminAuditRetentionDays > 90 {
+		return fmt.Errorf("ADMIN_AUDIT_LOG_RETENTION_DAYS must be between 1 and 90")
 	}
 	switch cfg.StorageBackend {
 	case "local":

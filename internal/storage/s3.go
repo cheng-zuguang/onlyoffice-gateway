@@ -278,6 +278,35 @@ func (s *S3Store) Expire(ctx context.Context) (int, error) {
 	return cleaned, nil
 }
 
+func (s *S3Store) List(ctx context.Context, query AttachmentQuery) ([]Meta, string, error) {
+	var token *string
+	items := []Meta{}
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(s.prefix), ContinuationToken: token})
+		if err != nil {
+			return nil, "", fmt.Errorf("list s3 attachment metadata: %w", err)
+		}
+		for _, object := range out.Contents {
+			if object.Key == nil || !strings.HasSuffix(*object.Key, "/meta.json") {
+				continue
+			}
+			documentID, ok := s.documentIDFromMetaKey(*object.Key)
+			if !ok {
+				continue
+			}
+			meta, err := s.GetMeta(ctx, documentID)
+			if err == nil {
+				items = append(items, *meta)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	return pageAttachments(items, query)
+}
+
 func (s *S3Store) putObject(ctx context.Context, key string, reader io.Reader, contentType string) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),

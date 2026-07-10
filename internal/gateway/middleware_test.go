@@ -2,14 +2,38 @@ package gateway_test
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/zenmind/onlyoffice-gateway/internal/audit"
+
 	"github.com/zenmind/onlyoffice-gateway/internal/gateway"
 )
+
+func TestAuditMiddlewareDoesNotPersistGenericHTTPRequests(t *testing.T) {
+	sink, err := audit.New(t.TempDir(), 14, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(gateway.AuditMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }), sink))
+	t.Cleanup(server.Close)
+	resp, err := http.Get(server.URL + "/admin/api/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	events, _, err := sink.List(context.Background(), audit.Query{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("generic HTTP request must not become an audit event: %#v", events)
+	}
+}
 
 // Tracer bullet: wrapping a handler with LoggingMiddleware logs
 // the HTTP method, request path, response status code, and duration.
@@ -122,10 +146,10 @@ func TestLoggingMiddlewareLogsFirstStatusCode(t *testing.T) {
 	resp.Body.Close()
 
 	output := buf.String()
-	if !strings.Contains(output, "201") {
+	if !strings.Contains(output, "documents 201 ") {
 		t.Fatalf("expected log to contain first status 201, got: %s", output)
 	}
-	if strings.Contains(output, "500") {
+	if strings.Contains(output, "documents 500 ") {
 		t.Fatalf("expected log not to be overwritten by second status, got: %s", output)
 	}
 }
