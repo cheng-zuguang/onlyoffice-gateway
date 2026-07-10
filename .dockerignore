@@ -1,0 +1,28 @@
+# Version control and local configuration
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Dependencies and build artifacts
+**/node_modules/
+**/dist/
+**/.vite/
+bin/
+coverage/
+*.log
+
+# Unrelated workspaces and runtime data are not needed to compile the gateway.
+admin-ui/
+frontend-sdk/
+data/
+docs/
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db

@@ -1,0 +1,21 @@
+# Version control and local configuration
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Host dependencies and generated frontend output
+node_modules/
+dist/
+.vite/
+coverage/
+*.log
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
