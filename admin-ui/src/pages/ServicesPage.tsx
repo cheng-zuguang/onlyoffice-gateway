@@ -6,8 +6,9 @@ import { Textarea } from '../components/ui/textarea'
 import { ConfirmDialog } from '../components/ui/confirm-dialog'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '../components/ui/dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
+import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip'
 import { listServices, createService, updateService, deleteService, type Service } from '../lib/api'
-import { Plus, Trash2, Server, Pencil } from 'lucide-react'
+import { Plus, Trash2, Server, Pencil, RefreshCw } from 'lucide-react'
 import { cn } from '../lib/utils'
 
 export default function ServicesPage() {
@@ -134,7 +135,7 @@ export default function ServicesPage() {
       <Dialog open={showForm} onOpenChange={(open) => !open && closeForm()}>
         <DialogContent>
           <DialogHeader><DialogTitle>{editingSvc ? `编辑“${editingSvc.id}”` : '新增服务'}</DialogTitle></DialogHeader>
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
 
             {!editingSvc && (
               <div className="space-y-2">
@@ -210,9 +211,14 @@ export default function ServicesPage() {
         {error && (
           <div className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-            <Button variant="link" size="sm" className="ml-1 h-auto px-0" onClick={() => { setError(''); fetchServices() }}>
-              重试
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" className="ml-1 size-7" aria-label="重试加载" onClick={() => { setError(''); fetchServices() }}>
+                  <RefreshCw className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>重试加载</TooltipContent>
+            </Tooltip>
           </div>
         )}
 
@@ -254,26 +260,38 @@ export default function ServicesPage() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => openEditForm(svc)}
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => promptDelete(svc)}
-                          disabled={deleting === svc.id}
-                        >
-                          <Trash2
-                            className={cn(
-                              'h-4 w-4',
-                              deleting === svc.id ? 'animate-pulse text-muted-foreground' : 'text-destructive',
-                            )}
-                          />
-                        </Button>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label="编辑服务"
+                              onClick={() => openEditForm(svc)}
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>编辑服务</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label="删除服务"
+                              onClick={() => promptDelete(svc)}
+                              disabled={deleting === svc.id}
+                            >
+                              <Trash2
+                                className={cn(
+                                  'h-4 w-4',
+                                  deleting === svc.id ? 'animate-pulse text-muted-foreground' : 'text-destructive',
+                                )}
+                              />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>删除服务</TooltipContent>
+                        </Tooltip>
                       </div>
                     </TableCell>
                   </TableRow>

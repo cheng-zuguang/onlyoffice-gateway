@@ -3,6 +3,8 @@ import { lazy, Suspense } from 'react'
 import { getToken, clearToken } from './lib/api'
 import { Key, Server, LogOut, FileArchive, ScrollText } from 'lucide-react'
 import { Button } from './components/ui/button'
+import { Toaster } from './components/ui/sonner'
+import { Tooltip, TooltipContent, TooltipTrigger } from './components/ui/tooltip'
 
 const LoginPage = lazy(() => import('./pages/LoginPage'))
 const ServicesPage = lazy(() => import('./pages/ServicesPage'))
@@ -28,15 +30,21 @@ function Layout({ children }: { children: React.ReactNode }) {
           <SidebarLink to="/admin/logs" icon={<ScrollText className="h-4 w-4" />}>运行日志</SidebarLink>
         </nav>
         <div className="border-t p-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="w-full justify-start text-muted-foreground"
-            onClick={handleLogout}
-          >
-            <LogOut className="h-4 w-4" />
-            退出登录
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="w-full justify-start text-muted-foreground"
+                aria-label="退出登录"
+                onClick={handleLogout}
+              >
+                <LogOut className="h-4 w-4" />
+                退出登录
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right">退出登录</TooltipContent>
+          </Tooltip>
         </div>
       </aside>
       <main className="flex min-h-0 flex-1 bg-muted/20 p-6 min-w-0">{children}</main>
@@ -67,6 +75,7 @@ function Loading() {
 export default function App() {
   return (
     <BrowserRouter>
+      <Toaster richColors position="top-right" />
       <Suspense fallback={<Loading />}>
         <Routes>
           <Route path="/admin/login" element={<LoginPage />} />

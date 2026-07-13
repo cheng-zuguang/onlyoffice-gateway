@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui/button";
+import { ConfirmDialog } from "../components/ui/confirm-dialog";
+import { toast } from "sonner";
+import { ChevronLeft, ChevronRight, Download, RotateCcw, Trash2, TimerReset } from "lucide-react";
 import {
 	Table,
 	TableBody,
@@ -9,8 +12,14 @@ import {
 	TableRow,
 } from "../components/ui/table";
 import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "../components/ui/tooltip";
+import {
 	cleanupAttachments,
 	deleteAttachment,
+	downloadAttachment,
 	extendAttachmentTTL,
 	listAttachments,
 	type Attachment,
@@ -22,6 +31,7 @@ export default function AttachmentsPage() {
 	const [nextCursor, setNextCursor] = useState("");
 	const [history, setHistory] = useState<string[]>([]);
 	const [error, setError] = useState("");
+	const [deleteTarget, setDeleteTarget] = useState<Attachment | null>(null);
 	const load = (next = cursor) =>
 		listAttachments(next)
 			.then((page) => { setItems(page.items); setNextCursor(page.next_cursor); setCursor(next) })
@@ -29,14 +39,14 @@ export default function AttachmentsPage() {
 	useEffect(() => {
 		void load("");
 	}, []);
-	const remove = async (id: string) => {
-		if (window.confirm("确定删除此临时附件？正在编辑的会话可能中断。")) {
-			await deleteAttachment(id);
-			void load();
-		}
+	const remove = async () => { if (!deleteTarget) return; try { await deleteAttachment(deleteTarget.document_id); toast.success("临时附件已删除"); await load() } catch (e) { toast.error(e instanceof Error ? e.message : "删除临时附件失败") } finally { setDeleteTarget(null) } };
+	const download = async (attachment: Attachment) => { try { const { blob, fileName } = await downloadAttachment(attachment.document_id); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = fileName || attachment.file_name; link.click(); URL.revokeObjectURL(url); toast.success("开始下载附件") } catch (e) { toast.error(e instanceof Error ? e.message : "下载临时附件失败") } };
+	const extendTTL = async (attachment: Attachment) => {
+		try { await extendAttachmentTTL(attachment.document_id, 24); toast.success("已延长 24 小时"); await load() } catch (e) { toast.error(e instanceof Error ? e.message : "延长有效期失败") }
 	};
 	return (
 		<section className="flex h-full min-h-0 w-full flex-col gap-6">
+			<ConfirmDialog open={deleteTarget !== null} title="删除临时附件" message={`确定删除“${deleteTarget?.file_name || deleteTarget?.document_id || ""}”吗？正在编辑的会话可能中断。`} confirmLabel="删除" variant="destructive" onConfirm={() => void remove()} onCancel={() => setDeleteTarget(null)} />
 			<header className="flex items-center justify-between">
 				<div>
 					<h2 className="text-lg font-semibold">临时附件</h2>
@@ -44,15 +54,21 @@ export default function AttachmentsPage() {
 						查看和管理 Gateway 临时托管的文档。
 					</p>
 				</div>
-				<Button
-					variant="outline"
-					onClick={async () => {
-						await cleanupAttachments();
-						void load();
-					}}
-				>
-					清理已过期附件
-				</Button>
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button
+							variant="outline"
+							size="icon"
+							aria-label="清理已过期附件"
+							onClick={async () => {
+								try { const cleaned = await cleanupAttachments(); toast.success(`已清理 ${cleaned} 个过期附件`); await load() } catch (e) { toast.error(e instanceof Error ? e.message : "清理过期附件失败") }
+							}}
+						>
+							<RotateCcw className="h-4 w-4" />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>清理已过期附件</TooltipContent>
+				</Tooltip>
 			</header>
 			{error && <p className="text-sm text-destructive">{error}</p>}
 			<div className="min-h-[200px] flex-1 overflow-auto rounded-lg border bg-card">
@@ -82,50 +98,69 @@ export default function AttachmentsPage() {
 								<TableCell>
 									{new Date(x.expires_at).toLocaleString()}
 								</TableCell>
-								<TableCell className="space-x-2 text-right">
-									{!x.direct_source && (
-										<Button
-											asChild
-											size="sm"
-											variant="outline"
-										>
-											<a
-												href={`/admin/api/attachments/${encodeURIComponent(x.document_id)}/download`}
-												target="_blank"
-											>
-												下载
-											</a>
-										</Button>
-									)}
-									<Button
-										size="sm"
-										variant="outline"
-										onClick={async () => {
-											await extendAttachmentTTL(
-												x.document_id,
-												24,
-											);
-											void load();
-										}}
-									>
-										延长 24h
-									</Button>
-									<Button
-										size="sm"
-										variant="destructive"
-										onClick={() =>
-											void remove(x.document_id)
-										}
-									>
-										删除
-									</Button>
+								<TableCell className="text-right">
+									<div className="flex items-center justify-end gap-1">
+										{!x.direct_source && (
+											<Tooltip>
+												<TooltipTrigger asChild>
+													<Button size="icon" variant="ghost" aria-label="下载附件" onClick={() => void download(x)}>
+														<Download className="h-4 w-4" />
+													</Button>
+												</TooltipTrigger>
+												<TooltipContent>下载附件</TooltipContent>
+											</Tooltip>
+										)}
+										<Tooltip>
+											<TooltipTrigger asChild>
+												<Button
+													size="icon"
+													variant="ghost"
+													aria-label="延长 24 小时"
+													onClick={() => void extendTTL(x)}
+												>
+													<TimerReset className="h-4 w-4" />
+												</Button>
+											</TooltipTrigger>
+											<TooltipContent>延长 24 小时</TooltipContent>
+										</Tooltip>
+										<Tooltip>
+											<TooltipTrigger asChild>
+												<Button
+													size="icon"
+													variant="ghost"
+													aria-label="删除附件"
+													onClick={() => setDeleteTarget(x)}
+												>
+													<Trash2 className="h-4 w-4 text-destructive" />
+												</Button>
+											</TooltipTrigger>
+											<TooltipContent>删除附件</TooltipContent>
+										</Tooltip>
+									</div>
 								</TableCell>
 							</TableRow>
 						))}
 					</TableBody>
 				</Table>
 			</div>
-			<div className="flex justify-end gap-2"><Button variant="outline" disabled={!history.length} onClick={() => { const previous = history[history.length - 1]; setHistory(history.slice(0, -1)); void load(previous) }}>上一页</Button><Button variant="outline" disabled={!nextCursor} onClick={() => { setHistory([...history, cursor]); void load(nextCursor) }}>下一页</Button></div>
+			<div className="flex justify-end gap-2">
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button variant="outline" size="icon" aria-label="上一页" disabled={!history.length} onClick={() => { const previous = history[history.length - 1]; setHistory(history.slice(0, -1)); void load(previous) }}>
+							<ChevronLeft className="h-4 w-4" />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>上一页</TooltipContent>
+				</Tooltip>
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button variant="outline" size="icon" aria-label="下一页" disabled={!nextCursor} onClick={() => { setHistory([...history, cursor]); void load(nextCursor) }}>
+							<ChevronRight className="h-4 w-4" />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>下一页</TooltipContent>
+				</Tooltip>
+			</div>
 		</section>
 	);
 }

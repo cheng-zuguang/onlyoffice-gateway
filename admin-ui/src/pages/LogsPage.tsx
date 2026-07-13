@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button } from "../components/ui/button";
+import { ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
 import {
 	Table,
 	TableBody,
@@ -8,6 +9,11 @@ import {
 	TableHeader,
 	TableRow,
 } from "../components/ui/table";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "../components/ui/tooltip";
 import { listAuditEvents, type AuditEvent } from "../lib/api";
 export default function LogsPage() {
 	const [items, setItems] = useState<AuditEvent[]>([]);
@@ -31,9 +37,14 @@ export default function LogsPage() {
 						当前 Gateway 实例的结构化审计日志。
 					</p>
 				</div>
-				<Button variant="outline" onClick={() => void load()}>
-					刷新
-				</Button>
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button variant="outline" size="icon" aria-label="刷新日志" onClick={() => void load()}>
+							<RefreshCw className="h-4 w-4" />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>刷新日志</TooltipContent>
+				</Tooltip>
 			</header>
 			{error && <p className="text-sm text-destructive">{error}</p>}
 			<div className="min-h-[200px] flex-1 overflow-auto rounded-lg border bg-card">
@@ -58,7 +69,24 @@ export default function LogsPage() {
 					</TableBody>
 				</Table>
 			</div>
-			<div className="flex justify-end gap-2"><Button variant="outline" disabled={!history.length} onClick={() => { const previous = history[history.length - 1]; setHistory(history.slice(0, -1)); void load(previous) }}>上一页</Button><Button variant="outline" disabled={!nextCursor} onClick={() => { setHistory([...history, cursor]); void load(nextCursor) }}>下一页</Button></div>
+			<div className="flex justify-end gap-2">
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button variant="outline" size="icon" aria-label="上一页" disabled={!history.length} onClick={() => { const previous = history[history.length - 1]; setHistory(history.slice(0, -1)); void load(previous) }}>
+							<ChevronLeft className="h-4 w-4" />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>上一页</TooltipContent>
+				</Tooltip>
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button variant="outline" size="icon" aria-label="下一页" disabled={!nextCursor} onClick={() => { setHistory([...history, cursor]); void load(nextCursor) }}>
+							<ChevronRight className="h-4 w-4" />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>下一页</TooltipContent>
+				</Tooltip>
+			</div>
 		</section>
 	);
 }
