@@ -153,7 +153,7 @@ export default function ServicesPage() {
               <Label htmlFor="svc-key">RSA Public Key (PEM)</Label>
               <Textarea
                 id="svc-key"
-                rows={6}
+                rows={20}
                 value={formData.public_key}
                 onChange={(e) => setFormData({ ...formData, public_key: e.target.value })}
                 placeholder="-----BEGIN PUBLIC KEY-----
@@ -170,7 +170,7 @@ export default function ServicesPage() {
               </Label>
               <Textarea
                 id="svc-domains"
-                rows={3}
+                rows={6}
                 value={formData.domains}
                 onChange={(e) => setFormData({ ...formData, domains: e.target.value })}
                 placeholder="example.com"
