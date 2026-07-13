@@ -1297,11 +1297,21 @@ func TestEditViewModeRendersReadonlyConfig(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, truncate(htmlStr, 200))
 	}
-	if !contains(htmlStr, `"mode":"view"`) {
-		t.Fatalf("expected editor config to include view mode, got: %s", truncate(htmlStr, 400))
+
+	editorConfig := extractEditorConfig(t, htmlStr)
+	ec := editorConfig["editorConfig"].(map[string]interface{})
+	if ec["mode"] != "view" {
+		t.Fatalf("expected editorConfig to include view mode, got: %v", ec["mode"])
 	}
-	if !contains(htmlStr, `"permissions":{"download":true,"edit":false}`) {
-		t.Fatalf("expected editor config to disable editing, got: %s", truncate(htmlStr, 600))
+	if _, ok := editorConfig["mode"]; ok {
+		t.Fatalf("expected view mode under editorConfig, got top-level mode %v", editorConfig["mode"])
+	}
+	permissions := editorConfig["document"].(map[string]interface{})["permissions"].(map[string]interface{})
+	if permissions["edit"] != false {
+		t.Fatalf("expected editor config to disable editing, got: %v", permissions["edit"])
+	}
+	if permissions["download"] != true {
+		t.Fatalf("expected editor config to allow downloads, got: %v", permissions["download"])
 	}
 }
 
@@ -1816,4 +1826,25 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func extractEditorConfig(t *testing.T, html string) map[string]interface{} {
+	t.Helper()
+
+	start := strings.Index(html, "var config = ")
+	if start == -1 {
+		t.Fatal("expected editor page to declare config")
+	}
+	start += len("var config = ")
+
+	end := strings.Index(html[start:], ";\n\n  function post")
+	if end == -1 {
+		t.Fatal("expected editor config declaration to terminate before post helper")
+	}
+
+	var config map[string]interface{}
+	if err := json.Unmarshal([]byte(html[start:start+end]), &config); err != nil {
+		t.Fatalf("unmarshal editor config: %v", err)
+	}
+	return config
 }

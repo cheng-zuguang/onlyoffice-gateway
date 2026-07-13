@@ -149,8 +149,12 @@ func TestBuilderViewModeDisablesEditing(t *testing.T) {
 	result := builder.Build()
 	m := unmarshal(result)
 
-	if m["mode"] != "view" {
-		t.Fatalf("expected top-level mode view, got %v", m["mode"])
+	ec := m["editorConfig"].(map[string]interface{})
+	if ec["mode"] != "view" {
+		t.Fatalf("expected editorConfig mode view, got %v", ec["mode"])
+	}
+	if _, ok := m["mode"]; ok {
+		t.Fatalf("expected view mode under editorConfig, got top-level mode %v", m["mode"])
 	}
 	permissions := m["document"].(map[string]interface{})["permissions"].(map[string]interface{})
 	if permissions["edit"] != false {

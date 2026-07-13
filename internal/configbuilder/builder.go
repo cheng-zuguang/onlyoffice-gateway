@@ -78,7 +78,8 @@ func (b *Builder) Build() json.RawMessage {
 	}
 
 	if b.params.Mode == "view" {
-		cfg["mode"] = "view"
+		ec := cfg["editorConfig"].(map[string]interface{})
+		ec["mode"] = "view"
 		doc := cfg["document"].(map[string]interface{})
 		permissions, _ := doc["permissions"].(map[string]interface{})
 		if permissions == nil {
