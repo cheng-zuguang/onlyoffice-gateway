@@ -50,7 +50,7 @@ func (b *Builder) Build() json.RawMessage {
 			"title":    b.params.Title,
 			"url":      b.params.DownloadURL,
 		},
-		"documentType": b.params.DocumentType,
+		"documentType": onlyOfficeDocumentType(b.params.DocumentType),
 		"editorConfig": map[string]interface{}{
 			"callbackUrl": b.params.CallbackURL,
 			"user":        b.params.User,
@@ -99,6 +99,13 @@ func (b *Builder) Build() json.RawMessage {
 
 	data, _ := json.Marshal(cfg)
 	return data
+}
+
+func onlyOfficeDocumentType(documentType string) string {
+	if documentType == "pdf" {
+		return "word"
+	}
+	return documentType
 }
 
 // deepMerge recursively merges src into dst. Src wins on conflicts.

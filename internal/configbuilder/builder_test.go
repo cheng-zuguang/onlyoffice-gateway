@@ -48,6 +48,29 @@ func TestBuilderReturnsGatewayDefaults(t *testing.T) {
 	}
 }
 
+func TestBuilderUsesLegacyDocumentTypeForPdfCompatibility(t *testing.T) {
+	builder := configbuilder.New(configbuilder.Params{
+		DocumentServerURL: "https://doc.example.com",
+		CallbackURL:       "https://gateway.example.com/callback",
+		DownloadURL:       "https://gateway.example.com/download/doc-pdf",
+		FileType:          "pdf",
+		Key:               "pdf-key",
+		Title:             "contract.pdf",
+		DocumentType:      "pdf",
+	})
+
+	result := builder.Build()
+	m := unmarshal(result)
+
+	doc := m["document"].(map[string]interface{})
+	if doc["fileType"] != "pdf" {
+		t.Fatalf("expected fileType pdf, got %v", doc["fileType"])
+	}
+	if m["documentType"] != "word" {
+		t.Fatalf("expected pdf to use legacy documentType word, got %v", m["documentType"])
+	}
+}
+
 // S22: Branding fields map to ONLYOFFICE customization config.
 func TestBuilderMergesBranding(t *testing.T) {
 	builder := configbuilder.New(configbuilder.Params{
