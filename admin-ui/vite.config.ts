@@ -7,7 +7,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { '@': path.resolve(__dirname, './src') } },
   server: {
-    port: 5173,
+    port: 16666,
     proxy: {
       '/admin/api': {
         target: 'http://localhost:18080',
