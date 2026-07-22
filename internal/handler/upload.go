@@ -14,13 +14,18 @@ import (
 )
 
 type UploadHandler struct {
-	cfg      *config.Config
-	resolver gwjwt.ServiceResolver
-	store    storage.Store
+	cfg                *config.Config
+	resolver           gwjwt.ServiceResolver
+	credentialResolver WebhookCredentialResolver
+	store              storage.Store
 }
 
-func NewUploadHandler(cfg *config.Config, resolver gwjwt.ServiceResolver, store storage.Store) *UploadHandler {
-	return &UploadHandler{cfg: cfg, resolver: resolver, store: store}
+type WebhookCredentialResolver interface {
+	ActiveWebhookSecret(serviceID string) (string, bool)
+}
+
+func NewUploadHandler(cfg *config.Config, resolver gwjwt.ServiceResolver, credentialResolver WebhookCredentialResolver, store storage.Store) *UploadHandler {
+	return &UploadHandler{cfg: cfg, resolver: resolver, credentialResolver: credentialResolver, store: store}
 }
 
 func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -50,11 +55,20 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	docType, _ := claims["document_type"].(string)
 	sourceURL, _ := claims["source_url"].(string)
 
-	// Validate webhook domain
-	if serviceID != "" {
+	// A webhook is optional for preview-only sessions. When requested, it must
+	// be both domain-allowed and backed by an active per-service credential.
+	if webhookURL != "" && serviceID != "" {
 		_, domains, found := h.resolver.Resolve(serviceID)
 		if found && !isDomainAllowed(domains, webhookURL) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "webhook domain not allowed"})
+			return
+		}
+		if h.credentialResolver == nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "webhook credential not configured"})
+			return
+		}
+		if _, ok := h.credentialResolver.ActiveWebhookSecret(serviceID); !ok {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "webhook credential not configured"})
 			return
 		}
 	}

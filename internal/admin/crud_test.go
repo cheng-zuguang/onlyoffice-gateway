@@ -2,6 +2,7 @@ package admin_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/admin"
+	"github.com/zenmind/onlyoffice-gateway/internal/audit"
 )
 
 func validPublicKeyPEM(t *testing.T) string {
@@ -47,10 +49,10 @@ func newAdminServer(t *testing.T) (*httptest.Server, *admin.InMemoryServiceStore
 	t.Helper()
 	store := admin.NewInMemoryServiceStore()
 	mux := admin.NewMux(admin.Opts{
-		AdminUsername: "admin",
-		AdminPassword: "secure-password",
-		JWTSecret:     "test-admin-secret",
-		Store:         store,
+		AdminUsername:      "admin",
+		AdminPassword:      "secure-password",
+		AdminSessionSecret: "test-admin-secret",
+		Store:              store,
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -142,6 +144,226 @@ func TestCreateAndListService(t *testing.T) {
 	}
 	if len(list[0].AllowedWebhookDomains) != 2 {
 		t.Fatalf("expected 2 domains, got %d", len(list[0].AllowedWebhookDomains))
+	}
+}
+
+func TestCreateServiceReturnsWebhookSecretOnce(t *testing.T) {
+	srv, _ := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	resp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:                    "doc",
+		PublicKeyPEM:          validPublicKeyPEM(t),
+		AllowedWebhookDomains: []string{"doc.example.com"},
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected Cache-Control no-store, got %q", got)
+	}
+	var created struct {
+		Service struct {
+			ID                      string `json:"id"`
+			WebhookSecretConfigured bool   `json:"webhook_secret_configured"`
+		} `json:"service"`
+		Credentials struct {
+			WebhookSecret string `json:"webhook_secret"`
+		} `json:"credentials"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if created.Service.ID != "doc" {
+		t.Fatalf("expected service doc, got %q", created.Service.ID)
+	}
+	if !created.Service.WebhookSecretConfigured {
+		t.Fatal("expected webhook secret to be configured")
+	}
+	if created.Credentials.WebhookSecret == "" {
+		t.Fatal("expected one-time webhook secret")
+	}
+
+	listResp := authGet(t, srv.URL+"/admin/api/services", token)
+	defer listResp.Body.Close()
+	var listed []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("expected one service, got %d", len(listed))
+	}
+	if _, exposed := listed[0]["webhook_secret"]; exposed {
+		t.Fatal("service list must not expose webhook_secret")
+	}
+}
+
+func TestCreateServiceWritesRedactedCredentialAuditEvent(t *testing.T) {
+	store := admin.NewInMemoryServiceStore()
+	auditLog, err := audit.New(t.TempDir(), 14, "test")
+	if err != nil {
+		t.Fatalf("create audit log: %v", err)
+	}
+	mux := admin.NewMux(admin.Opts{
+		AdminUsername:      "admin",
+		AdminPassword:      "secure-password",
+		AdminSessionSecret: "test-admin-secret",
+		Store:              store,
+		AuditLog:           auditLog,
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	token := loginAndGetToken(t, srv.URL)
+
+	resp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:           "doc",
+		PublicKeyPEM: validPublicKeyPEM(t),
+	})
+	resp.Body.Close()
+
+	items, _, err := auditLog.List(context.Background(), audit.Query{Type: "admin.service_webhook_credential_created"})
+	if err != nil {
+		t.Fatalf("list audit log: %v", err)
+	}
+	if len(items) != 1 || items[0].ServiceID != "doc" {
+		t.Fatalf("expected one redacted credential audit event, got %#v", items)
+	}
+}
+
+func TestRotateWebhookSecretCreatesPendingWithoutChangingActive(t *testing.T) {
+	srv, store := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	createResp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:           "doc",
+		PublicKeyPEM: validPublicKeyPEM(t),
+	})
+	defer createResp.Body.Close()
+	var created struct {
+		Credentials struct {
+			WebhookSecret string `json:"webhook_secret"`
+		} `json:"credentials"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	rotateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/rotate", token, nil)
+	defer rotateResp.Body.Close()
+	if rotateResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rotateResp.StatusCode)
+	}
+	if got := rotateResp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected Cache-Control no-store, got %q", got)
+	}
+	var rotated struct {
+		Credentials struct {
+			WebhookSecret string `json:"webhook_secret"`
+		} `json:"credentials"`
+	}
+	if err := json.NewDecoder(rotateResp.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotate response: %v", err)
+	}
+	if rotated.Credentials.WebhookSecret == "" {
+		t.Fatal("expected one-time pending webhook secret")
+	}
+	if rotated.Credentials.WebhookSecret == created.Credentials.WebhookSecret {
+		t.Fatal("pending webhook secret must differ from active secret")
+	}
+	active, ok := store.ActiveWebhookSecret("doc")
+	if !ok || active != created.Credentials.WebhookSecret {
+		t.Fatal("rotating must not change the active webhook secret")
+	}
+}
+
+func TestActivateWebhookSecretMakesPendingCredentialActive(t *testing.T) {
+	srv, store := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	createResp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:           "doc",
+		PublicKeyPEM: validPublicKeyPEM(t),
+	})
+	createResp.Body.Close()
+	rotateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/rotate", token, nil)
+	defer rotateResp.Body.Close()
+	var rotated struct {
+		Credentials struct {
+			WebhookSecret string `json:"webhook_secret"`
+		} `json:"credentials"`
+	}
+	if err := json.NewDecoder(rotateResp.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotate response: %v", err)
+	}
+
+	activateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/activate", token, nil)
+	defer activateResp.Body.Close()
+	if activateResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", activateResp.StatusCode)
+	}
+	active, ok := store.ActiveWebhookSecret("doc")
+	if !ok || active != rotated.Credentials.WebhookSecret {
+		t.Fatal("activating must make the pending webhook secret active")
+	}
+}
+
+func TestRollbackWebhookSecretRestoresPreviousCredential(t *testing.T) {
+	srv, store := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	createResp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:           "doc",
+		PublicKeyPEM: validPublicKeyPEM(t),
+	})
+	defer createResp.Body.Close()
+	var created struct {
+		Credentials struct {
+			WebhookSecret string `json:"webhook_secret"`
+		} `json:"credentials"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	rotateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/rotate", token, nil)
+	rotateResp.Body.Close()
+	activateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/activate", token, nil)
+	activateResp.Body.Close()
+
+	rollbackResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/rollback", token, nil)
+	defer rollbackResp.Body.Close()
+	if rollbackResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rollbackResp.StatusCode)
+	}
+	active, ok := store.ActiveWebhookSecret("doc")
+	if !ok || active != created.Credentials.WebhookSecret {
+		t.Fatal("rollback must restore the previous webhook secret")
+	}
+}
+
+func TestActivateResponseMakesRollbackAvailabilityVisible(t *testing.T) {
+	srv, _ := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	createResp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:           "doc",
+		PublicKeyPEM: validPublicKeyPEM(t),
+	})
+	createResp.Body.Close()
+	rotateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/rotate", token, nil)
+	rotateResp.Body.Close()
+	activateResp := authPost(t, srv.URL+"/admin/api/services/doc/webhook-secret/activate", token, nil)
+	defer activateResp.Body.Close()
+
+	var view struct {
+		WebhookSecretRollbackAvailable bool `json:"webhook_secret_rollback_available"`
+	}
+	if err := json.NewDecoder(activateResp.Body).Decode(&view); err != nil {
+		t.Fatalf("decode activate response: %v", err)
+	}
+	if !view.WebhookSecretRollbackAvailable {
+		t.Fatal("activate response must expose the active rollback window")
 	}
 }
 
@@ -290,6 +512,37 @@ func TestUpdateService(t *testing.T) {
 	}
 	if len(result.AllowedWebhookDomains) != 2 || result.AllowedWebhookDomains[0] != "new.example.com" {
 		t.Fatalf("expected domains [new.example.com, also.example.com], got %v", result.AllowedWebhookDomains)
+	}
+}
+
+func TestUpdateServicePreservesWebhookCredential(t *testing.T) {
+	srv, _ := newAdminServer(t)
+	token := loginAndGetToken(t, srv.URL)
+
+	createResp := authPost(t, srv.URL+"/admin/api/services", token, admin.ServiceRecord{
+		ID:                    "doc",
+		PublicKeyPEM:          validPublicKeyPEM(t),
+		AllowedWebhookDomains: []string{"old.example.com"},
+	})
+	createResp.Body.Close()
+
+	updateResp := authPut(t, srv.URL+"/admin/api/services/doc", token, admin.ServiceRecord{
+		ID:                    "doc",
+		PublicKeyPEM:          validPublicKeyPEM(t),
+		AllowedWebhookDomains: []string{"new.example.com"},
+	})
+	defer updateResp.Body.Close()
+	if updateResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", updateResp.StatusCode)
+	}
+	var updated struct {
+		WebhookSecretConfigured bool `json:"webhook_secret_configured"`
+	}
+	if err := json.NewDecoder(updateResp.Body).Decode(&updated); err != nil {
+		t.Fatalf("decode update response: %v", err)
+	}
+	if !updated.WebhookSecretConfigured {
+		t.Fatal("updating service identity fields must preserve webhook credential")
 	}
 }
 

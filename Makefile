@@ -3,7 +3,7 @@ BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 LDFLAGS := -ldflags "-X github.com/zenmind/onlyoffice-gateway/internal/version.Version=$(VERSION) -X github.com/zenmind/onlyoffice-gateway/internal/version.BuildTime=$(BUILD_TIME) -X github.com/zenmind/onlyoffice-gateway/internal/version.Commit=$(COMMIT)"
 
-.PHONY: build test run clean version frontend-build frontend-dev dev
+.PHONY: build test run clean version frontend-build frontend-dev dev init-secrets test-init-secrets
 
 version:
 	@echo $(VERSION)
@@ -14,11 +14,17 @@ build:
 test:
 	go test ./... -count=1 -timeout 120s
 
+init-secrets:
+	@./scripts/init-secrets.sh
+
+test-init-secrets:
+	@sh ./scripts/init-secrets-test.sh
+
 run:
 	@if [ ! -f .env ] && [ -f .env.example ]; then \
 		echo "NOTE: .env not found — creating from .env.example"; \
 		cp .env.example .env; \
-		echo "  → Edit .env to set ADMIN_PASSWORD, JWT_SECRET, etc."; \
+		echo "  → Run 'make init-secrets', then set ADMIN_PASSWORD."; \
 	fi
 	go run -ldflags "-X github.com/zenmind/onlyoffice-gateway/internal/version.Version=$(VERSION)" ./cmd/gateway
 
@@ -41,7 +47,7 @@ dev:
 	@if [ ! -f .env ] && [ -f .env.example ]; then \
 		echo "NOTE: .env not found — creating from .env.example"; \
 		cp .env.example .env; \
-		echo "  → Edit .env to set ADMIN_PASSWORD, JWT_SECRET, etc."; \
+		echo "  → Run 'make init-secrets', then set ADMIN_PASSWORD."; \
 	fi
 	@set -e; \
 		echo "Starting gateway on :18080..."; \

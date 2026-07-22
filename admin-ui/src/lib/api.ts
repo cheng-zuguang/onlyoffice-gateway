@@ -43,6 +43,24 @@ export interface Service {
   id: string
   public_key: string
   allowed_webhook_domains: string[]
+  webhook_secret_configured: boolean
+  webhook_secret_last_rotated_at?: string
+  webhook_secret_pending: boolean
+  webhook_secret_rollback_available?: boolean
+}
+
+export interface ServiceCredentialResponse {
+  service: Service
+  credentials: {
+    webhook_secret: string
+  }
+}
+
+export interface RotatedServiceCredentialResponse {
+  service_id: string
+  credentials: {
+    webhook_secret: string
+  }
 }
 
 export interface LoginResponse {
@@ -77,7 +95,7 @@ export async function createService(svc: {
   id: string
   public_key: string
   allowed_webhook_domains: string[]
-}): Promise<Service> {
+}): Promise<ServiceCredentialResponse> {
   const res = await request('POST', '/services', svc)
   if (!res.ok) {
     const err: ApiError = await res.json()
@@ -103,6 +121,33 @@ export async function updateService(svc: {
   if (!res.ok) {
     const err: ApiError = await res.json()
     throw new Error(err.error || 'Failed to update service')
+  }
+  return res.json()
+}
+
+export async function rotateWebhookSecret(id: string): Promise<RotatedServiceCredentialResponse> {
+  const res = await request('POST', `/services/${encodeURIComponent(id)}/webhook-secret/rotate`)
+  if (!res.ok) {
+    const err: ApiError = await res.json()
+    throw new Error(err.error || '生成待切换 Webhook 凭证失败')
+  }
+  return res.json()
+}
+
+export async function activateWebhookSecret(id: string): Promise<Service> {
+  const res = await request('POST', `/services/${encodeURIComponent(id)}/webhook-secret/activate`)
+  if (!res.ok) {
+    const err: ApiError = await res.json()
+    throw new Error(err.error || '激活 Webhook 凭证失败')
+  }
+  return res.json()
+}
+
+export async function rollbackWebhookSecret(id: string): Promise<Service> {
+  const res = await request('POST', `/services/${encodeURIComponent(id)}/webhook-secret/rollback`)
+  if (!res.ok) {
+    const err: ApiError = await res.json()
+    throw new Error(err.error || '回滚 Webhook 凭证失败')
   }
   return res.json()
 }

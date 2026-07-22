@@ -22,7 +22,10 @@ func TestMainStartsAndRespondsToHealth(t *testing.T) {
 	// Write config without services
 	cfg := fmt.Sprintf(`listen_addr: "127.0.0.1:18999"
 document_server_url: "https://doc.example.com"
-jwt_secret: "test-secret"
+document_server_jwt_secret: "test-document-server-secret-0001"
+gateway_admin_session_secret: "test-admin-session-secret-00000001"
+gateway_callback_capability_secret: "test-callback-capability-secret-01"
+webhook_secret_encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 storage_dir: "%s"
 ttl_hours: 8
 webhook_max_retries: 3
@@ -50,7 +53,10 @@ webhook_max_retries: 3
 	cmd.Env = append(os.Environ(),
 		"LISTEN_ADDR=127.0.0.1:18999",
 		"DOCUMENT_SERVER_URL=https://doc.example.com",
-		"JWT_SECRET=test-secret",
+		"DOCUMENT_SERVER_JWT_SECRET=test-document-server-secret-0001",
+		"GATEWAY_ADMIN_SESSION_SECRET=test-admin-session-secret-00000001",
+		"GATEWAY_CALLBACK_CAPABILITY_SECRET=test-callback-capability-secret-01",
+		"WEBHOOK_SECRET_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
 		"SERVICE_STORE_PATH="+servicesPath,
 		"ADMIN_USERNAME=admin",
 		"ADMIN_PASSWORD=admin123",

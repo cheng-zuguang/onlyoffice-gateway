@@ -26,7 +26,7 @@ func TestAdministratorListsTemporaryAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create audit log: %v", err)
 	}
-	mux := admin.NewMux(admin.Opts{AdminUsername: "admin", AdminPassword: "secure-password", JWTSecret: "test-admin-secret", Store: admin.NewInMemoryServiceStore(), AttachmentStore: attachments, AuditLog: auditLog})
+	mux := admin.NewMux(admin.Opts{AdminUsername: "admin", AdminPassword: "secure-password", AdminSessionSecret: "test-admin-secret", Store: admin.NewInMemoryServiceStore(), AttachmentStore: attachments, AuditLog: auditLog})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	token := loginAndGetToken(t, srv.URL)

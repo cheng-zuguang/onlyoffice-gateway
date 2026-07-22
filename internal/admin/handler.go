@@ -1,9 +1,13 @@
 package admin
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -25,12 +29,12 @@ import (
 
 // Opts holds dependencies for the admin mux.
 type Opts struct {
-	AdminUsername   string
-	AdminPassword   string
-	JWTSecret       string
-	Store           *InMemoryServiceStore
-	AttachmentStore storage.Store
-	AuditLog        *audit.Log
+	AdminUsername      string
+	AdminPassword      string
+	AdminSessionSecret string
+	Store              *InMemoryServiceStore
+	AttachmentStore    storage.Store
+	AuditLog           *audit.Log
 }
 
 // NewMux returns an http.Handler mounting all admin API routes.
@@ -39,11 +43,11 @@ func NewMux(opts Opts) http.Handler {
 	auth := &authHandler{
 		username: opts.AdminUsername,
 		password: opts.AdminPassword,
-		jwtKey:   []byte(opts.JWTSecret),
+		jwtKey:   []byte(opts.AdminSessionSecret),
 	}
 	mux.HandleFunc("POST /admin/api/login", auth.handleLogin)
 
-	svc := &serviceHandler{store: opts.Store}
+	svc := &serviceHandler{store: opts.Store, audit: opts.AuditLog}
 	protect := func(h http.HandlerFunc) http.HandlerFunc {
 		return auth.middleware(h)
 	}
@@ -51,6 +55,9 @@ func NewMux(opts Opts) http.Handler {
 	mux.HandleFunc("POST /admin/api/services", protect(svc.handleCreateService))
 	mux.HandleFunc("PUT /admin/api/services/{id}", protect(svc.handleUpdateService))
 	mux.HandleFunc("DELETE /admin/api/services/{id}", protect(svc.handleDeleteService))
+	mux.HandleFunc("POST /admin/api/services/{id}/webhook-secret/rotate", protect(svc.handleRotateWebhookSecret))
+	mux.HandleFunc("POST /admin/api/services/{id}/webhook-secret/activate", protect(svc.handleActivateWebhookSecret))
+	mux.HandleFunc("POST /admin/api/services/{id}/webhook-secret/rollback", protect(svc.handleRollbackWebhookSecret))
 	attachments := &attachmentHandler{store: opts.AttachmentStore, audit: opts.AuditLog}
 	mux.HandleFunc("GET /admin/api/attachments", protect(attachments.handleList))
 	mux.HandleFunc("GET /admin/api/attachments/{id}", protect(attachments.handleGet))
@@ -325,10 +332,50 @@ func (h *authHandler) middleware(next http.HandlerFunc) http.HandlerFunc {
 
 type serviceHandler struct {
 	store *InMemoryServiceStore
+	audit *audit.Log
+}
+
+func (h *serviceHandler) writeCredentialAudit(r *http.Request, serviceID, eventType string) error {
+	if h.audit == nil {
+		return nil
+	}
+	return h.audit.Write(r.Context(), audit.Event{
+		Level:     "info",
+		Type:      eventType,
+		ServiceID: serviceID,
+	})
+}
+
+type serviceView struct {
+	ID                             string    `json:"id"`
+	PublicKeyPEM                   string    `json:"public_key"`
+	AllowedWebhookDomains          []string  `json:"allowed_webhook_domains"`
+	WebhookSecretConfigured        bool      `json:"webhook_secret_configured"`
+	WebhookSecretLastRotatedAt     time.Time `json:"webhook_secret_last_rotated_at,omitempty"`
+	WebhookSecretPending           bool      `json:"webhook_secret_pending"`
+	WebhookSecretRollbackAvailable bool      `json:"webhook_secret_rollback_available"`
+}
+
+func viewService(svc ServiceRecord) serviceView {
+	return serviceView{
+		ID:                         svc.ID,
+		PublicKeyPEM:               svc.PublicKeyPEM,
+		AllowedWebhookDomains:      append([]string(nil), svc.AllowedWebhookDomains...),
+		WebhookSecretConfigured:    svc.webhookSecret != "",
+		WebhookSecretLastRotatedAt: svc.webhookSecretCreatedAt,
+		WebhookSecretPending:       svc.pendingWebhookSecret != "",
+		WebhookSecretRollbackAvailable: svc.previousWebhookSecret != "" &&
+			time.Now().UTC().Before(svc.previousSecretExpiresAt),
+	}
 }
 
 func (h *serviceHandler) handleListServices(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, h.store.List())
+	services := h.store.List()
+	views := make([]serviceView, 0, len(services))
+	for _, svc := range services {
+		views = append(views, viewService(svc))
+	}
+	writeJSON(w, http.StatusOK, views)
 }
 
 func (h *serviceHandler) handleCreateService(w http.ResponseWriter, r *http.Request) {
@@ -341,7 +388,8 @@ func (h *serviceHandler) handleCreateService(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
 		return
 	}
-	if err := h.store.Create(svc); err != nil {
+	secret, err := h.store.CreateWithWebhookCredential(svc)
+	if err != nil {
 		if err == errServiceExists {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "service id already exists"})
 			return
@@ -354,7 +402,17 @@ func (h *serviceHandler) handleCreateService(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "service was not created"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, created)
+	if err := h.writeCredentialAudit(r, svc.ID, "admin.service_webhook_credential_created"); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"service": viewService(*created),
+		"credentials": map[string]string{
+			"webhook_secret": secret,
+		},
+	})
 }
 
 func (h *serviceHandler) handleUpdateService(w http.ResponseWriter, r *http.Request) {
@@ -374,7 +432,7 @@ func (h *serviceHandler) handleUpdateService(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	updated, _ := h.store.Get(id)
-	writeJSON(w, http.StatusOK, updated)
+	writeJSON(w, http.StatusOK, viewService(*updated))
 }
 
 func (h *serviceHandler) handleDeleteService(w http.ResponseWriter, r *http.Request) {
@@ -390,6 +448,72 @@ func (h *serviceHandler) handleDeleteService(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
+func (h *serviceHandler) handleRotateWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	secret, err := h.store.RotateWebhookSecret(r.PathValue("id"), time.Now().UTC())
+	if err != nil {
+		switch err {
+		case errServiceNotFound:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+		case errWebhookSecretPending:
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "pending webhook secret already exists"})
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	if err := h.writeCredentialAudit(r, r.PathValue("id"), "admin.service_webhook_credential_rotation_pending"); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"service_id": r.PathValue("id"),
+		"credentials": map[string]string{
+			"webhook_secret": secret,
+		},
+	})
+}
+
+func (h *serviceHandler) handleActivateWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.ActivateWebhookSecret(r.PathValue("id"), time.Now().UTC()); err != nil {
+		switch err {
+		case errServiceNotFound:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+		case errNoPendingWebhookSecret:
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "pending webhook secret not found"})
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	if err := h.writeCredentialAudit(r, r.PathValue("id"), "admin.service_webhook_credential_activated"); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	svc, _ := h.store.Get(r.PathValue("id"))
+	writeJSON(w, http.StatusOK, viewService(*svc))
+}
+
+func (h *serviceHandler) handleRollbackWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	if err := h.store.RollbackWebhookSecret(r.PathValue("id"), time.Now().UTC()); err != nil {
+		switch err {
+		case errServiceNotFound:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "service not found"})
+		case errWebhookRollbackUnavailable:
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "webhook secret rollback unavailable"})
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	if err := h.writeCredentialAudit(r, r.PathValue("id"), "admin.service_webhook_credential_rolled_back"); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit log unavailable"})
+		return
+	}
+	svc, _ := h.store.Get(r.PathValue("id"))
+	writeJSON(w, http.StatusOK, viewService(*svc))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -403,22 +527,48 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 // InMemoryServiceStore holds service records in memory, safe for concurrent use.
 // When a path is set, Add and Remove persist to disk.
 type InMemoryServiceStore struct {
-	mu         sync.RWMutex
-	services   []ServiceRecord
-	publicKeys map[string]*rsa.PublicKey
-	path       string
+	mu            sync.RWMutex
+	services      []ServiceRecord
+	publicKeys    map[string]*rsa.PublicKey
+	path          string
+	encryptionKey []byte
 }
 
 // ServiceRecord represents one external service authorized to use the gateway.
 type ServiceRecord struct {
-	ID                    string   `json:"id"`
-	PublicKeyPEM          string   `json:"public_key"`
-	AllowedWebhookDomains []string `json:"allowed_webhook_domains"`
+	ID                      string                  `json:"id"`
+	PublicKeyPEM            string                  `json:"public_key"`
+	AllowedWebhookDomains   []string                `json:"allowed_webhook_domains"`
+	WebhookCredentials      *WebhookCredentialState `json:"webhook_credentials,omitempty"`
+	webhookSecret           string
+	webhookSecretCreatedAt  time.Time
+	pendingWebhookSecret    string
+	pendingSecretCreatedAt  time.Time
+	previousWebhookSecret   string
+	previousSecretCreatedAt time.Time
+	previousSecretExpiresAt time.Time
+}
+
+type WebhookCredentialState struct {
+	Active   *EncryptedWebhookSecret `json:"active,omitempty"`
+	Pending  *EncryptedWebhookSecret `json:"pending,omitempty"`
+	Previous *EncryptedWebhookSecret `json:"previous,omitempty"`
+}
+
+type EncryptedWebhookSecret struct {
+	Version    int       `json:"version"`
+	Nonce      string    `json:"nonce"`
+	Ciphertext string    `json:"ciphertext"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
 }
 
 var (
-	errServiceExists   = errors.New("service id already exists")
-	errServiceNotFound = errors.New("service not found")
+	errServiceExists              = errors.New("service id already exists")
+	errServiceNotFound            = errors.New("service not found")
+	errWebhookSecretPending       = errors.New("pending webhook secret already exists")
+	errNoPendingWebhookSecret     = errors.New("pending webhook secret not found")
+	errWebhookRollbackUnavailable = errors.New("webhook secret rollback unavailable")
 )
 
 // NewInMemoryServiceStore returns an empty in-memory store.
@@ -429,7 +579,18 @@ func NewInMemoryServiceStore() *InMemoryServiceStore {
 // NewPersistentServiceStore loads services from a JSON file, or creates an
 // empty file if none exists. Mutations are persisted immediately.
 func NewPersistentServiceStore(path string) (*InMemoryServiceStore, error) {
-	store := &InMemoryServiceStore{path: path, publicKeys: make(map[string]*rsa.PublicKey)}
+	return NewPersistentServiceStoreWithEncryptionKey(path, nil)
+}
+
+func NewPersistentServiceStoreWithEncryptionKey(path string, encryptionKey []byte) (*InMemoryServiceStore, error) {
+	if len(encryptionKey) != 0 && len(encryptionKey) != 32 {
+		return nil, fmt.Errorf("webhook secret encryption key must be 32 bytes")
+	}
+	store := &InMemoryServiceStore{
+		path:          path,
+		publicKeys:    make(map[string]*rsa.PublicKey),
+		encryptionKey: append([]byte(nil), encryptionKey...),
+	}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
@@ -441,7 +602,9 @@ func (s *InMemoryServiceStore) List() []ServiceRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]ServiceRecord, len(s.services))
-	copy(out, s.services)
+	for i := range s.services {
+		out[i] = cloneServiceRecord(s.services[i])
+	}
 	return out
 }
 
@@ -451,7 +614,8 @@ func (s *InMemoryServiceStore) Get(id string) (*ServiceRecord, bool) {
 	defer s.mu.RUnlock()
 	for i := range s.services {
 		if s.services[i].ID == id {
-			return &s.services[i], true
+			copy := cloneServiceRecord(s.services[i])
+			return &copy, true
 		}
 	}
 	return nil, false
@@ -517,6 +681,219 @@ func (s *InMemoryServiceStore) Create(svc ServiceRecord) error {
 	return nil
 }
 
+// CreateWithWebhookCredential creates a service with a new one-time webhook
+// credential. The plaintext is returned only to the authenticated create call.
+func (s *InMemoryServiceStore) CreateWithWebhookCredential(svc ServiceRecord) (string, error) {
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return "", fmt.Errorf("generate webhook secret: %w", err)
+	}
+	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
+	svc.webhookSecret = secret
+	svc.webhookSecretCreatedAt = time.Now().UTC()
+	if s.path != "" {
+		encrypted, err := s.encryptWebhookSecret(svc.ID, "active", secret, svc.webhookSecretCreatedAt)
+		if err != nil {
+			return "", err
+		}
+		svc.WebhookCredentials = &WebhookCredentialState{Active: encrypted}
+	}
+	if err := s.Create(svc); err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+func (s *InMemoryServiceStore) ActiveWebhookSecret(serviceID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := range s.services {
+		if s.services[i].ID == serviceID && s.services[i].webhookSecret != "" {
+			return s.services[i].webhookSecret, true
+		}
+	}
+	return "", false
+}
+
+func (s *InMemoryServiceStore) RotateWebhookSecret(serviceID string, now time.Time) (string, error) {
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return "", fmt.Errorf("generate webhook secret: %w", err)
+	}
+	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.services {
+		if s.services[i].ID != serviceID {
+			continue
+		}
+		if s.services[i].pendingWebhookSecret != "" {
+			return "", errWebhookSecretPending
+		}
+		next := append([]ServiceRecord(nil), s.services...)
+		next[i].WebhookCredentials = cloneWebhookCredentialState(next[i].WebhookCredentials)
+		next[i].pendingWebhookSecret = secret
+		next[i].pendingSecretCreatedAt = now
+		if s.path != "" {
+			encrypted, err := s.encryptWebhookSecret(serviceID, "pending", secret, now)
+			if err != nil {
+				return "", err
+			}
+			if next[i].WebhookCredentials == nil {
+				next[i].WebhookCredentials = &WebhookCredentialState{}
+			}
+			next[i].WebhookCredentials.Pending = encrypted
+		}
+		if err := s.saveServices(next); err != nil {
+			return "", err
+		}
+		s.services = next
+		return secret, nil
+	}
+	return "", errServiceNotFound
+}
+
+func (s *InMemoryServiceStore) ActivateWebhookSecret(serviceID string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.services {
+		current := s.services[i]
+		if current.ID != serviceID {
+			continue
+		}
+		if current.pendingWebhookSecret == "" {
+			return errNoPendingWebhookSecret
+		}
+		next := append([]ServiceRecord(nil), s.services...)
+		next[i].previousWebhookSecret = current.webhookSecret
+		next[i].previousSecretCreatedAt = current.webhookSecretCreatedAt
+		next[i].previousSecretExpiresAt = now.Add(10 * time.Minute)
+		next[i].webhookSecret = current.pendingWebhookSecret
+		next[i].webhookSecretCreatedAt = current.pendingSecretCreatedAt
+		next[i].pendingWebhookSecret = ""
+		next[i].pendingSecretCreatedAt = time.Time{}
+		if s.path != "" {
+			state := &WebhookCredentialState{}
+			active, err := s.encryptWebhookSecret(serviceID, "active", next[i].webhookSecret, next[i].webhookSecretCreatedAt)
+			if err != nil {
+				return err
+			}
+			state.Active = active
+			if next[i].previousWebhookSecret != "" {
+				previous, err := s.encryptWebhookSecret(serviceID, "previous", next[i].previousWebhookSecret, current.webhookSecretCreatedAt)
+				if err != nil {
+					return err
+				}
+				previous.ExpiresAt = next[i].previousSecretExpiresAt
+				state.Previous = previous
+			}
+			next[i].WebhookCredentials = state
+		}
+		if err := s.saveServices(next); err != nil {
+			return err
+		}
+		s.services = next
+		return nil
+	}
+	return errServiceNotFound
+}
+
+func (s *InMemoryServiceStore) RollbackWebhookSecret(serviceID string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.services {
+		current := s.services[i]
+		if current.ID != serviceID {
+			continue
+		}
+		if current.previousWebhookSecret == "" || !current.previousSecretExpiresAt.After(now) {
+			return errWebhookRollbackUnavailable
+		}
+		next := append([]ServiceRecord(nil), s.services...)
+		next[i].webhookSecret = current.previousWebhookSecret
+		next[i].webhookSecretCreatedAt = current.previousSecretCreatedAt
+		next[i].previousWebhookSecret = ""
+		next[i].previousSecretCreatedAt = time.Time{}
+		next[i].previousSecretExpiresAt = time.Time{}
+		if s.path != "" {
+			active, err := s.encryptWebhookSecret(serviceID, "active", next[i].webhookSecret, next[i].webhookSecretCreatedAt)
+			if err != nil {
+				return err
+			}
+			next[i].WebhookCredentials = &WebhookCredentialState{Active: active}
+		}
+		if err := s.saveServices(next); err != nil {
+			return err
+		}
+		s.services = next
+		return nil
+	}
+	return errServiceNotFound
+}
+
+func (s *InMemoryServiceStore) encryptWebhookSecret(serviceID, slot, secret string, createdAt time.Time) (*EncryptedWebhookSecret, error) {
+	if len(s.encryptionKey) != 32 {
+		return nil, fmt.Errorf("webhook secret encryption key is required for persistent service store")
+	}
+	block, err := aes.NewCipher(s.encryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("create webhook secret cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create webhook secret gcm: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generate webhook secret nonce: %w", err)
+	}
+	ciphertext := gcm.Seal(nil, nonce, []byte(secret), webhookSecretAAD(serviceID, slot))
+	return &EncryptedWebhookSecret{
+		Version:    1,
+		Nonce:      base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
+		CreatedAt:  createdAt,
+	}, nil
+}
+
+func (s *InMemoryServiceStore) decryptWebhookSecret(serviceID, slot string, encrypted *EncryptedWebhookSecret) (string, error) {
+	if encrypted == nil {
+		return "", nil
+	}
+	if encrypted.Version != 1 {
+		return "", fmt.Errorf("unsupported webhook secret version %d", encrypted.Version)
+	}
+	if len(s.encryptionKey) != 32 {
+		return "", fmt.Errorf("webhook secret encryption key is required")
+	}
+	block, err := aes.NewCipher(s.encryptionKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce, err := base64.StdEncoding.DecodeString(encrypted.Nonce)
+	if err != nil {
+		return "", fmt.Errorf("decode webhook secret nonce: %w", err)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(encrypted.Ciphertext)
+	if err != nil {
+		return "", fmt.Errorf("decode webhook secret ciphertext: %w", err)
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, webhookSecretAAD(serviceID, slot))
+	if err != nil {
+		return "", fmt.Errorf("decrypt webhook secret: %w", err)
+	}
+	return string(plaintext), nil
+}
+
+func webhookSecretAAD(serviceID, slot string) []byte {
+	return []byte("onlyoffice-gateway:webhook-secret:v1:" + serviceID + ":" + slot)
+}
+
 // Remove deletes a service by ID and returns true if it existed.
 func (s *InMemoryServiceStore) Remove(id string) bool {
 	return s.Delete(id) == nil
@@ -555,6 +932,14 @@ func (s *InMemoryServiceStore) Update(id string, svc ServiceRecord) error {
 	}
 	for i := range s.services {
 		if s.services[i].ID == id {
+			svc.WebhookCredentials = cloneWebhookCredentialState(s.services[i].WebhookCredentials)
+			svc.webhookSecret = s.services[i].webhookSecret
+			svc.webhookSecretCreatedAt = s.services[i].webhookSecretCreatedAt
+			svc.pendingWebhookSecret = s.services[i].pendingWebhookSecret
+			svc.pendingSecretCreatedAt = s.services[i].pendingSecretCreatedAt
+			svc.previousWebhookSecret = s.services[i].previousWebhookSecret
+			svc.previousSecretCreatedAt = s.services[i].previousSecretCreatedAt
+			svc.previousSecretExpiresAt = s.services[i].previousSecretExpiresAt
 			next := append([]ServiceRecord(nil), s.services...)
 			next[i] = svc
 			next[i].ID = id
@@ -569,13 +954,39 @@ func (s *InMemoryServiceStore) Update(id string, svc ServiceRecord) error {
 	return errServiceNotFound
 }
 
+func cloneServiceRecord(svc ServiceRecord) ServiceRecord {
+	svc.AllowedWebhookDomains = append([]string(nil), svc.AllowedWebhookDomains...)
+	svc.WebhookCredentials = cloneWebhookCredentialState(svc.WebhookCredentials)
+	return svc
+}
+
+func cloneWebhookCredentialState(state *WebhookCredentialState) *WebhookCredentialState {
+	if state == nil {
+		return nil
+	}
+	clone := &WebhookCredentialState{}
+	if state.Active != nil {
+		active := *state.Active
+		clone.Active = &active
+	}
+	if state.Pending != nil {
+		pending := *state.Pending
+		clone.Pending = &pending
+	}
+	if state.Previous != nil {
+		previous := *state.Previous
+		clone.Previous = &previous
+	}
+	return clone
+}
+
 func (s *InMemoryServiceStore) load() error {
 	if s.path == "" {
 		return nil
 	}
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
-		return os.WriteFile(s.path, []byte("[]"), 0644)
+		return os.WriteFile(s.path, []byte("[]"), 0600)
 	}
 	if err != nil {
 		return fmt.Errorf("read services file: %w", err)
@@ -583,12 +994,38 @@ func (s *InMemoryServiceStore) load() error {
 	if err := json.Unmarshal(data, &s.services); err != nil {
 		return err
 	}
-	for _, svc := range s.services {
-		pub, err := validateServiceRecord(svc)
+	for i := range s.services {
+		svc := &s.services[i]
+		pub, err := validateServiceRecord(*svc)
 		if err != nil {
 			return fmt.Errorf("service %s: %w", svc.ID, err)
 		}
 		s.publicKeys[svc.ID] = pub
+		if svc.WebhookCredentials != nil && svc.WebhookCredentials.Active != nil {
+			secret, err := s.decryptWebhookSecret(svc.ID, "active", svc.WebhookCredentials.Active)
+			if err != nil {
+				return fmt.Errorf("service %s active webhook secret: %w", svc.ID, err)
+			}
+			svc.webhookSecret = secret
+			svc.webhookSecretCreatedAt = svc.WebhookCredentials.Active.CreatedAt
+		}
+		if svc.WebhookCredentials != nil && svc.WebhookCredentials.Pending != nil {
+			secret, err := s.decryptWebhookSecret(svc.ID, "pending", svc.WebhookCredentials.Pending)
+			if err != nil {
+				return fmt.Errorf("service %s pending webhook secret: %w", svc.ID, err)
+			}
+			svc.pendingWebhookSecret = secret
+			svc.pendingSecretCreatedAt = svc.WebhookCredentials.Pending.CreatedAt
+		}
+		if svc.WebhookCredentials != nil && svc.WebhookCredentials.Previous != nil {
+			secret, err := s.decryptWebhookSecret(svc.ID, "previous", svc.WebhookCredentials.Previous)
+			if err != nil {
+				return fmt.Errorf("service %s previous webhook secret: %w", svc.ID, err)
+			}
+			svc.previousWebhookSecret = secret
+			svc.previousSecretCreatedAt = svc.WebhookCredentials.Previous.CreatedAt
+			svc.previousSecretExpiresAt = svc.WebhookCredentials.Previous.ExpiresAt
+		}
 	}
 	return nil
 }

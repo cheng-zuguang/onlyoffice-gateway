@@ -80,7 +80,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Build the ONLYOFFICE config using the config builder
 	builder := configbuilder.New(configbuilder.Params{
 		DocumentServerURL: h.cfg.DocumentServerURL,
-		CallbackURL:       h.serverURL + "/callback?token=" + callbackCapability(documentID, h.cfg.JWTSecret),
+		CallbackURL:       h.serverURL + "/callback?token=" + callbackCapability(documentID, h.cfg.CallbackCapabilitySecret),
 		DownloadURL:       downloadURL,
 		FileType:          meta.FileType,
 		Key:               documentID,
@@ -93,7 +93,7 @@ func (h *EditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"id":   "gateway-user",
 			"name": "User",
 		},
-		JWTSecret: h.cfg.JWTSecret,
+		JWTSecret: h.cfg.DocumentServerJWTSecret,
 	})
 
 	configJSON := builder.Build()

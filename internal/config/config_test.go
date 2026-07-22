@@ -128,3 +128,46 @@ func TestValidateRejectsMissingJWTSecret(t *testing.T) {
 		t.Fatal("expected configuration without JWT_SECRET to be rejected")
 	}
 }
+
+func TestValidateRejectsLegacyJWTSecretWithoutSplitSecrets(t *testing.T) {
+	t.Setenv("JWT_SECRET", "legacy-secret-that-must-not-be-reused")
+	cfg, err := config.FromLiteral(&config.Config{
+		DocumentServerURL:       "https://docs.example.com",
+		StorageBackend:          "local",
+		StorageDir:              t.TempDir(),
+		TTLHours:                8,
+		MaxUploadBytes:          1024,
+		CleanupInterval:         time.Minute,
+		CallbackQueueSize:       8,
+		CallbackWorkers:         1,
+		AdminAuditRetentionDays: 14,
+	})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("legacy JWT_SECRET must not satisfy the split secret configuration")
+	}
+}
+
+func TestValidateRejectsReusedGatewaySecrets(t *testing.T) {
+	cfg := &config.Config{
+		DocumentServerURL:          "https://docs.example.com",
+		DocumentServerJWTSecret:    "document-server-secret-0123456789",
+		AdminSessionSecret:         "reused-gateway-secret-01234567890",
+		CallbackCapabilitySecret:   "reused-gateway-secret-01234567890",
+		WebhookSecretEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+		StorageBackend:             "local",
+		StorageDir:                 t.TempDir(),
+		TTLHours:                   8,
+		MaxUploadBytes:             1024,
+		CleanupInterval:            time.Minute,
+		CallbackQueueSize:          8,
+		CallbackWorkers:            1,
+		AdminAuditRetentionDays:    14,
+	}
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("reusing a secret across gateway security domains must be rejected")
+	}
+}

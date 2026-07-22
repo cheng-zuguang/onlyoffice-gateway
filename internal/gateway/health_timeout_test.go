@@ -29,11 +29,12 @@ func TestDocumentServerHealthCheckTimesOut(t *testing.T) {
 	t.Cleanup(func() { documentServerHTTPClient = previousClient })
 
 	cfg := &config.Config{
-		DocumentServerURL: blockingDS.URL,
-		JWTSecret:         "test-secret",
-		StorageDir:        filepath.Join(t.TempDir(), "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		DocumentServerURL:        blockingDS.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0002",
+		CallbackCapabilitySecret: "test-callback-capability-secret-02",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, err := config.FromLiteral(cfg)
 	if err != nil {

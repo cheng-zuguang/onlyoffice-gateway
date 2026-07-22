@@ -7,8 +7,8 @@ import { ConfirmDialog } from '../components/ui/confirm-dialog'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '../components/ui/dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip'
-import { listServices, createService, updateService, deleteService, type Service } from '../lib/api'
-import { Plus, Trash2, Server, Pencil, RefreshCw } from 'lucide-react'
+import { listServices, createService, updateService, deleteService, rotateWebhookSecret, activateWebhookSecret, rollbackWebhookSecret, type Service } from '../lib/api'
+import { Plus, Trash2, Server, Pencil, RefreshCw, Copy, KeyRound, BadgeCheck, RotateCcw } from 'lucide-react'
 import { cn } from '../lib/utils'
 
 export default function ServicesPage() {
@@ -20,6 +20,13 @@ export default function ServicesPage() {
   const [formData, setFormData] = useState({ id: '', public_key: '', domains: '' })
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
+  const [oneTimeCredential, setOneTimeCredential] = useState<{ serviceId: string; secret: string; pending: boolean } | null>(null)
+  const [rotating, setRotating] = useState<string | null>(null)
+  const [credentialAction, setCredentialAction] = useState<{
+    open: boolean
+    serviceId: string
+    action: 'activate' | 'rollback'
+  }>({ open: false, serviceId: '', action: 'activate' })
   const [deleting, setDeleting] = useState<string | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<{
     open: boolean
@@ -89,7 +96,12 @@ export default function ServicesPage() {
           setSubmitting(false)
           return
         }
-        await createService(payload)
+        const result = await createService(payload)
+        setOneTimeCredential({
+          serviceId: result.service.id,
+          secret: result.credentials.webhook_secret,
+          pending: false,
+        })
       }
       closeForm()
       await fetchServices()
@@ -102,6 +114,40 @@ export default function ServicesPage() {
 
   const promptDelete = (svc: Service) => {
     setConfirmDialog({ open: true, id: svc.id, name: svc.id })
+  }
+
+  const handleRotate = async (svc: Service) => {
+    setRotating(svc.id)
+    setError('')
+    try {
+      const result = await rotateWebhookSecret(svc.id)
+      setOneTimeCredential({
+        serviceId: result.service_id,
+        secret: result.credentials.webhook_secret,
+        pending: true,
+      })
+      await fetchServices()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '生成待切换 Webhook 凭证失败')
+    } finally {
+      setRotating(null)
+    }
+  }
+
+  const handleCredentialActionConfirm = async () => {
+    const { serviceId, action } = credentialAction
+    setCredentialAction({ open: false, serviceId: '', action: 'activate' })
+    setError('')
+    try {
+      if (action === 'activate') {
+        await activateWebhookSecret(serviceId)
+      } else {
+        await rollbackWebhookSecret(serviceId)
+      }
+      await fetchServices()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '更新 Webhook 凭证失败')
+    }
   }
 
   const handleDeleteConfirm = async () => {
@@ -130,6 +176,53 @@ export default function ServicesPage() {
         onConfirm={handleDeleteConfirm}
         onCancel={() => setConfirmDialog({ open: false, id: '', name: '' })}
       />
+      <ConfirmDialog
+        open={credentialAction.open}
+        title={credentialAction.action === 'activate' ? '激活待切换 Webhook 凭证' : '回滚 Webhook 凭证'}
+        message={credentialAction.action === 'activate'
+          ? '确认业务服务已配置刚生成的新凭证并重启。激活后 Gateway 将立即使用新凭证签名。'
+          : '确认回滚到上一个 Webhook 凭证。业务服务必须仍保留旧凭证，否则回调会认证失败。'}
+        confirmLabel={credentialAction.action === 'activate' ? '确认激活' : '确认回滚'}
+        variant={credentialAction.action === 'activate' ? 'default' : 'destructive'}
+        onConfirm={handleCredentialActionConfirm}
+        onCancel={() => setCredentialAction({ open: false, serviceId: '', action: 'activate' })}
+      />
+
+      <Dialog
+        open={oneTimeCredential !== null}
+        onOpenChange={(open) => {
+          if (!open) setOneTimeCredential(null)
+        }}
+      >
+        <DialogContent showCloseButton={false}>
+          <DialogHeader><DialogTitle>请立即保存 Webhook 凭证</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              服务“{oneTimeCredential?.serviceId}”的凭证只展示这一次，关闭后无法再次查看。
+            </p>
+            {oneTimeCredential?.pending && (
+              <p className="rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
+                该凭证尚未激活。请先配置到业务服务并重启，再执行激活。
+              </p>
+            )}
+            <div className="flex items-center gap-2 rounded-md border bg-muted/40 p-3">
+              <code className="min-w-0 flex-1 break-all text-sm">{oneTimeCredential?.secret}</code>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                aria-label="复制 Webhook 凭证"
+                onClick={() => oneTimeCredential && navigator.clipboard.writeText(oneTimeCredential.secret)}
+              >
+                <Copy className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setOneTimeCredential(null)}>我已保存，关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Form modal — outside space-y-6 so fixed positioning isn't broken */}
       <Dialog open={showForm} onOpenChange={(open) => !open && closeForm()}>
@@ -260,6 +353,52 @@ export default function ServicesPage() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
+                        {svc.webhook_secret_pending && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="激活待切换凭证"
+                                onClick={() => setCredentialAction({ open: true, serviceId: svc.id, action: 'activate' })}
+                              >
+                                <BadgeCheck className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>激活待切换凭证</TooltipContent>
+                          </Tooltip>
+                        )}
+                        {svc.webhook_secret_rollback_available && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="回滚 Webhook 凭证"
+                                onClick={() => setCredentialAction({ open: true, serviceId: svc.id, action: 'rollback' })}
+                              >
+                                <RotateCcw className="h-4 w-4 text-destructive" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>在十分钟窗口内回滚凭证</TooltipContent>
+                          </Tooltip>
+                        )}
+                        {!svc.webhook_secret_pending && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="生成待切换凭证"
+                                onClick={() => handleRotate(svc)}
+                                disabled={rotating === svc.id}
+                              >
+                                <KeyRound className={cn('h-4 w-4', rotating === svc.id && 'animate-pulse')} />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>生成待切换凭证</TooltipContent>
+                          </Tooltip>
+                        )}
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <Button

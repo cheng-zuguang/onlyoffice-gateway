@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,18 +76,19 @@ func setupGatewayWithMaxUploadBytes(t *testing.T, privPEM, pubPEM string, whitel
 	storageDir := filepath.Join(tmpDir, "storage")
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		MaxUploadBytes:    maxUploadBytes,
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        "https://doc.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               storageDir,
+		MaxUploadBytes:           maxUploadBytes,
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: whitelist,
@@ -99,7 +101,7 @@ func setupGatewayWithMaxUploadBytes(t *testing.T, privPEM, pubPEM string, whitel
 }
 
 func callbackURL(serverURL, documentID string) string {
-	mac := hmac.New(sha256.New, []byte("test-gateway-jwt-secret"))
+	mac := hmac.New(sha256.New, []byte("test-callback-capability-secret-01"))
 	mac.Write([]byte("callback:" + documentID))
 	return serverURL + "/callback?token=" + hex.EncodeToString(mac.Sum(nil))
 }
@@ -164,6 +166,65 @@ func TestUploadDocument(t *testing.T) {
 	}
 	if string(downloaded) != "fake-docx-content" {
 		t.Fatalf("expected original content, got %q", string(downloaded))
+	}
+}
+
+func TestUploadRequiresCredentialOnlyWhenWebhookRequested(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	cfg, err := config.FromLiteral(&config.Config{
+		DocumentServerURL:        "https://doc.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		MaxUploadBytes:           100 << 20,
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
+	})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	store := admin.NewInMemoryServiceStore()
+	store.Add(admin.ServiceRecord{
+		ID:                    "preview-only",
+		PublicKeyPEM:          pubPEM,
+		AllowedWebhookDomains: []string{"doc.example.com"},
+	})
+	server := httptest.NewServer(gateway.NewHandler(cfg, store))
+	defer server.Close()
+
+	create := func(webhookURL string) *http.Response {
+		t.Helper()
+		claims := jwt.MapClaims{
+			"service_id":    "preview-only",
+			"source_url":    "https://files.example.com/report.docx",
+			"file_name":     "report.docx",
+			"document_type": "word",
+			"exp":           time.Now().Add(time.Minute).Unix(),
+		}
+		if webhookURL != "" {
+			claims["webhook_url"] = webhookURL
+		}
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/documents", nil)
+		req.Header.Set("Authorization", "Bearer "+signUploadJWT(t, privPEM, claims))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("create document: %v", err)
+		}
+		return resp
+	}
+
+	withWebhook := create("https://doc.example.com/api/onlyoffice/webhook")
+	defer withWebhook.Body.Close()
+	if withWebhook.StatusCode != http.StatusUnprocessableEntity {
+		body, _ := io.ReadAll(withWebhook.Body)
+		t.Fatalf("expected 422 without webhook credential, got %d: %s", withWebhook.StatusCode, body)
+	}
+
+	previewOnly := create("")
+	defer previewOnly.Body.Close()
+	if previewOnly.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(previewOnly.Body)
+		t.Fatalf("expected preview-only session to be created, got %d: %s", previewOnly.StatusCode, body)
 	}
 }
 
@@ -933,6 +994,39 @@ func TestWebhookRetriesThenGivesUp(t *testing.T) {
 	}
 }
 
+func TestWebhookDoesNotRetryPermanentClientError(t *testing.T) {
+	privPEM, pubPEM := generateRSAKeyPair(t)
+	var attempts atomic.Int32
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer webhookServer.Close()
+
+	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"127.0.0.1"})
+	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", webhookServer.URL+"/callback")
+
+	editServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("edited"))
+	}))
+	defer editServer.Close()
+	body := bytes.NewReader(toJSON(map[string]interface{}{
+		"status": 2, "key": docID, "url": editServer.URL + "/file.docx",
+	}))
+	req, _ := http.NewRequest(http.MethodPost, callbackURL(server.URL, docID), body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("send callback: %v", err)
+	}
+	resp.Body.Close()
+
+	time.Sleep(1600 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("expected one delivery for permanent 401, got %d", got)
+	}
+}
+
 // S10: Editor page returns valid HTML with api.js and placeholder.
 func TestEditorPageReturnsHTML(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
@@ -1026,17 +1120,18 @@ func TestExpiredDocumentCleaned(t *testing.T) {
 	storageDir := filepath.Join(tmpDir, "storage")
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          -1,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        "https://doc.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               storageDir,
+		TTLHours:                 -1,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1084,18 +1179,19 @@ func TestExpiredDocumentsAreCleanedAutomatically(t *testing.T) {
 	tmpDir := t.TempDir()
 	storageDir := filepath.Join(tmpDir, "storage")
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        storageDir,
-		TTLHours:          -1,
-		CleanupInterval:   20 * time.Millisecond,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        "https://doc.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               storageDir,
+		TTLHours:                 -1,
+		CleanupInterval:          20 * time.Millisecond,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1188,22 +1284,33 @@ func TestCallbackDebounceSkipsWithinWindow(t *testing.T) {
 	}
 }
 
-// S25: Webhook POST includes X-Gateway-Signature HMAC header.
-func TestWebhookIncludesSignature(t *testing.T) {
+// S25: Webhook POST is signed with the active service credential.
+func TestWebhookIncludesVersionedServiceSignature(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
 
-	var receivedSig string
-	var receivedBody string
+	type delivery struct {
+		serviceID  string
+		timestamp  string
+		deliveryID string
+		signature  string
+		body       string
+	}
+	received := make(chan delivery, 1)
 	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedSig = r.Header.Get("X-Gateway-Signature")
 		b, _ := io.ReadAll(r.Body)
-		receivedBody = string(b)
+		received <- delivery{
+			serviceID:  r.Header.Get("X-Gateway-Service-Id"),
+			timestamp:  r.Header.Get("X-Gateway-Timestamp"),
+			deliveryID: r.Header.Get("X-Gateway-Delivery-Id"),
+			signature:  r.Header.Get("X-Gateway-Signature"),
+			body:       string(b),
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer webhookServer.Close()
 
 	domain := "127.0.0.1"
-	server, _, _ := setupGateway(t, privPEM, pubPEM, []string{"test.example.com", domain})
+	server, _, serviceStore := setupGateway(t, privPEM, pubPEM, []string{"test.example.com", domain})
 
 	docID := uploadTestDocument(t, server.URL, privPEM, "test-service", webhookServer.URL+"/callback")
 
@@ -1220,16 +1327,31 @@ func TestWebhookIncludesSignature(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	time.Sleep(500 * time.Millisecond)
-
-	if receivedSig == "" {
-		t.Fatal("expected X-Gateway-Signature header in webhook, got none")
+	var got delivery
+	select {
+	case got = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook")
 	}
-	if receivedBody == "" {
-		t.Fatal("expected webhook body")
+	if got.serviceID != "test-service" {
+		t.Fatalf("expected service id test-service, got %q", got.serviceID)
 	}
-	if !strings.Contains(receivedBody, "document.saved") {
-		t.Fatalf("expected webhook body to contain document.saved, got: %s", receivedBody)
+	if got.timestamp == "" || got.deliveryID == "" {
+		t.Fatalf("expected timestamp and delivery id, got timestamp=%q delivery=%q", got.timestamp, got.deliveryID)
+	}
+	secret, ok := serviceStore.ActiveWebhookSecret("test-service")
+	if !ok {
+		t.Fatal("expected active webhook credential")
+	}
+	signingInput := "v1\n" + got.serviceID + "\n" + got.timestamp + "\n" + got.deliveryID + "\n" + got.body
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signingInput))
+	wantSignature := "v1=" + hex.EncodeToString(mac.Sum(nil))
+	if got.signature != wantSignature {
+		t.Fatalf("unexpected webhook signature: got %q want %q", got.signature, wantSignature)
+	}
+	if !strings.Contains(got.body, "document.saved") {
+		t.Fatalf("expected webhook body to contain document.saved, got: %s", got.body)
 	}
 }
 
@@ -1381,18 +1503,19 @@ func TestEditUsesPublicDocumentServerURLForBrowserScript(t *testing.T) {
 	privPEM, pubPEM := generateRSAKeyPair(t)
 	tmpDir := t.TempDir()
 	cfg := &config.Config{
-		ListenAddr:              "127.0.0.1:18080",
-		DocumentServerURL:       "http://document-server",
-		DocumentServerPublicURL: "https://office.example.com",
-		JWTSecret:               "test-gateway-jwt-secret",
-		StorageDir:              filepath.Join(tmpDir, "storage"),
-		TTLHours:                8,
-		WebhookMaxRetries:       3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        "http://document-server",
+		DocumentServerPublicURL:  "https://office.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(tmpDir, "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1470,17 +1593,18 @@ func TestGatewayProxiesDocumentServerWebAssets(t *testing.T) {
 	defer documentServer.Close()
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: documentServer.URL,
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        filepath.Join(t.TempDir(), "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        documentServer.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1522,17 +1646,18 @@ func TestGatewayProxiesVersionedDocumentServerWebAssets(t *testing.T) {
 	defer documentServer.Close()
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: documentServer.URL,
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        filepath.Join(t.TempDir(), "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        documentServer.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1572,17 +1697,18 @@ func TestGatewayCachesDocumentServerCacheAssets(t *testing.T) {
 	defer documentServer.Close()
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: documentServer.URL,
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        filepath.Join(t.TempDir(), "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        documentServer.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1615,17 +1741,18 @@ func TestGatewayDoesNotProxyNonVersionedUnknownRootPaths(t *testing.T) {
 	defer documentServer.Close()
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: documentServer.URL,
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        filepath.Join(t.TempDir(), "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        documentServer.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1657,17 +1784,18 @@ func TestGatewayDoesNotOverrideDynamicDocumentServerCacheHeaders(t *testing.T) {
 	defer documentServer.Close()
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: documentServer.URL,
-		JWTSecret:         "test-gateway-jwt-secret",
-		StorageDir:        filepath.Join(t.TempDir(), "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        documentServer.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0001",
+		CallbackCapabilitySecret: "test-callback-capability-secret-01",
+		StorageDir:               filepath.Join(t.TempDir(), "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test-service",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"test.example.com"},
@@ -1780,17 +1908,18 @@ func TestDocumentServerHealthCheck(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cfg := &config.Config{
-		ListenAddr:        "127.0.0.1:18080",
-		DocumentServerURL: fakeDS.URL,
-		JWTSecret:         "test-secret",
-		StorageDir:        filepath.Join(tmpDir, "storage"),
-		TTLHours:          8,
-		WebhookMaxRetries: 3,
+		ListenAddr:               "127.0.0.1:18080",
+		DocumentServerURL:        fakeDS.URL,
+		DocumentServerJWTSecret:  "test-document-server-secret-0002",
+		CallbackCapabilitySecret: "test-callback-capability-secret-02",
+		StorageDir:               filepath.Join(tmpDir, "storage"),
+		TTLHours:                 8,
+		WebhookMaxRetries:        3,
 	}
 	loaded, _ := config.FromLiteral(cfg)
 
 	store := admin.NewInMemoryServiceStore()
-	store.Add(admin.ServiceRecord{
+	_, _ = store.CreateWithWebhookCredential(admin.ServiceRecord{
 		ID:                    "test",
 		PublicKeyPEM:          pubPEM,
 		AllowedWebhookDomains: []string{"localhost"},

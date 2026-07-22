@@ -13,10 +13,10 @@ import (
 func TestLoginWithValidCredentials(t *testing.T) {
 	store := admin.NewInMemoryServiceStore()
 	mux := admin.NewMux(admin.Opts{
-		AdminUsername: "admin",
-		AdminPassword: "secure-password",
-		JWTSecret:     "test-admin-secret",
-		Store:         store,
+		AdminUsername:      "admin",
+		AdminPassword:      "secure-password",
+		AdminSessionSecret: "test-admin-secret",
+		Store:              store,
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -48,10 +48,10 @@ func TestLoginWithValidCredentials(t *testing.T) {
 func TestLoginRejectsWrongPassword(t *testing.T) {
 	store := admin.NewInMemoryServiceStore()
 	mux := admin.NewMux(admin.Opts{
-		AdminUsername: "admin",
-		AdminPassword: "secure-password",
-		JWTSecret:     "test-admin-secret",
-		Store:         store,
+		AdminUsername:      "admin",
+		AdminPassword:      "secure-password",
+		AdminSessionSecret: "test-admin-secret",
+		Store:              store,
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

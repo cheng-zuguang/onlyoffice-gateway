@@ -45,7 +45,11 @@ func main() {
 	if serviceStorePath == "" {
 		serviceStorePath = "./data/services.json"
 	}
-	serviceStore, err := admin.NewPersistentServiceStore(serviceStorePath)
+	encryptionKey, err := cfg.WebhookSecretEncryptionKeyBytes()
+	if err != nil {
+		log.Fatalf("load webhook secret encryption key: %v", err)
+	}
+	serviceStore, err := admin.NewPersistentServiceStoreWithEncryptionKey(serviceStorePath, encryptionKey)
 	if err != nil {
 		log.Fatalf("load service store: %v", err)
 	}
@@ -115,12 +119,12 @@ func newRootRuntime(cfg *config.Config, serviceStore *admin.InMemoryServiceStore
 		panic("failed to create audit log: " + err.Error())
 	}
 	adminMux := admin.NewMux(admin.Opts{
-		AdminUsername:   adminUser,
-		AdminPassword:   adminPass,
-		JWTSecret:       cfg.JWTSecret,
-		Store:           serviceStore,
-		AttachmentStore: gwRuntime.Store,
-		AuditLog:        auditLog,
+		AdminUsername:      adminUser,
+		AdminPassword:      adminPass,
+		AdminSessionSecret: cfg.AdminSessionSecret,
+		Store:              serviceStore,
+		AttachmentStore:    gwRuntime.Store,
+		AuditLog:           auditLog,
 	})
 
 	mux := http.NewServeMux()

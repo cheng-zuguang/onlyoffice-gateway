@@ -1,12 +1,70 @@
 package admin_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/zenmind/onlyoffice-gateway/internal/admin"
 )
+
+func TestWebhookSecretPersistsEncryptedAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "services.json")
+	key := bytes.Repeat([]byte{0x42}, 32)
+
+	store1, err := admin.NewPersistentServiceStoreWithEncryptionKey(path, key)
+	if err != nil {
+		t.Fatalf("create encrypted store: %v", err)
+	}
+	secret, err := store1.CreateWithWebhookCredential(admin.ServiceRecord{
+		ID:                    "doc",
+		PublicKeyPEM:          validPublicKeyPEM(t),
+		AllowedWebhookDomains: []string{"doc.example.com"},
+	})
+	if err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read service store: %v", err)
+	}
+	if bytes.Contains(onDisk, []byte(secret)) {
+		t.Fatal("services.json must not contain the plaintext webhook secret")
+	}
+
+	store2, err := admin.NewPersistentServiceStoreWithEncryptionKey(path, key)
+	if err != nil {
+		t.Fatalf("reload encrypted store: %v", err)
+	}
+	reloaded, ok := store2.ActiveWebhookSecret("doc")
+	if !ok {
+		t.Fatal("expected active webhook secret after restart")
+	}
+	if reloaded != secret {
+		t.Fatal("reloaded webhook secret does not match the generated credential")
+	}
+}
+
+func TestEncryptedWebhookSecretRejectsWrongMasterKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "services.json")
+	store, err := admin.NewPersistentServiceStoreWithEncryptionKey(path, bytes.Repeat([]byte{0x42}, 32))
+	if err != nil {
+		t.Fatalf("create encrypted store: %v", err)
+	}
+	if _, err := store.CreateWithWebhookCredential(admin.ServiceRecord{
+		ID:           "doc",
+		PublicKeyPEM: validPublicKeyPEM(t),
+	}); err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+
+	if _, err := admin.NewPersistentServiceStoreWithEncryptionKey(path, bytes.Repeat([]byte{0x43}, 32)); err == nil {
+		t.Fatal("loading encrypted credentials with a different master key must fail")
+	}
+}
 
 func TestServiceStorePersistsAcrossRestarts(t *testing.T) {
 	dir := t.TempDir()

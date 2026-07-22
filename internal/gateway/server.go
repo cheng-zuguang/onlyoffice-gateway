@@ -56,13 +56,14 @@ func NewRuntime(cfg *config.Config, resolver ServiceResolver) *Runtime {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("POST /api/v1/documents", handler.NewUploadHandler(cfg, resolver, store))
+	credentialResolver, _ := resolver.(handler.WebhookCredentialResolver)
+	mux.Handle("POST /api/v1/documents", handler.NewUploadHandler(cfg, resolver, credentialResolver, store))
 
 	mux.HandleFunc("GET /api/v1/documents/{id}", func(w http.ResponseWriter, r *http.Request) {
 		handler.NewDownloadHandler(store).ServeHTTP(w, r)
 	})
 
-	callbackHandler := handler.NewCallbackHandlerWithOptions(store, cfg.WebhookMaxRetries, cfg.JWTSecret, handler.CallbackOptions{
+	callbackHandler := handler.NewCallbackHandlerWithOptions(store, cfg.WebhookMaxRetries, cfg.CallbackCapabilitySecret, credentialResolver, handler.CallbackOptions{
 		QueueSize: cfg.CallbackQueueSize,
 		Workers:   cfg.CallbackWorkers,
 	})

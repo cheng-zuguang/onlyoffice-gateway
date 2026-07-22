@@ -19,35 +19,45 @@ ONLYOFFICE Docs API 要求每个接入服务自行处理：
 **Gateway 收敛所有 ONLYOFFICE 协议细节**，业务服务只需 3 步：
 
 ```
-1. POST 文件到 Gateway    → 拿到 document_id
+1. POST 文件或 source_url 到 Gateway → 拿到 document_id
 2. <OnlyOfficeEditor />   → 一行组件嵌入编辑器
 3. 收 Webhook → 下载结果   → 文件回到手里
 ```
 
 ## 架构
 
+Gateway 是唯一的 ONLYOFFICE 集成边界，不按业务形态拆成两套架构。桌面端、本地文件型服务和线上已托管文件型服务都注册到同一个 Gateway；差异只体现在创建编辑会话时选择哪种文件接入模式。
+
 ```
- 业务服务 A/B/C                     Gateway                   Document Server
-      │                                │                            │
-      │── POST /api/v1/documents ─────→│                            │
-      │   (multipart + JWT自签)         │── 生成 OO config ────────→│
-      │                                │   callbackUrl = Gateway    │
-      │  iframe /edit?token=JWT        │   document.url = Gateway   │
-      │      ┌─────────────────────┐   │                            │
-      │      │  DocsAPI.DocEditor  │   │                            │
-      │      │  postMessage hooks  │   │                            │
-      │      └─────────────────────┘   │                            │
-      │                                │←── GET /download/{id} ─────│
-      │                                │── 文件二进制 ──────────────→│
-      │                                │                            │
-      │                                │    用户编辑文档            │
-      │                                │                            │
-      │                                │←── POST /callback ────────│
-      │                                │    status=2, url=...       │
-      │←── Webhook 通知 ──────────────│                            │
-      │── GET /api/v1/documents/{id}─→│                            │
-      │←── 编辑结果 ─────────────────│                            │
+ 业务服务 A/B/C                         Gateway                  Document Server
+      │                                    │                           │
+      │── POST /api/v1/documents ─────────→│                           │
+      │   A: multipart 文件上传             │── 生成 OO config ────────→│
+      │   B: source_url 元数据直连          │   callbackUrl = Gateway   │
+      │                                    │   document.url = Gateway  │
+      │  iframe /edit?token=JWT            │        或 source_url      │
+      │      ┌─────────────────────┐       │                           │
+      │      │  DocsAPI.DocEditor  │       │                           │
+      │      │  postMessage hooks  │       │                           │
+      │      └─────────────────────┘       │                           │
+      │                                    │←── GET document.url ──────│
+      │                                    │── 文件二进制 ─────────────→│
+      │                                    │                           │
+      │                                    │    用户编辑文档           │
+      │                                    │                           │
+      │                                    │←── POST /callback ───────│
+      │                                    │    status=2, url=...      │
+      │←── Webhook 通知 ──────────────────│                           │
+      │── 保存编辑结果到业务侧文件系统/对象存储                         │
 ```
+
+两类典型接入方：
+
+| 业务形态 | 文件现状 | 推荐接入模式 | 说明 |
+|---|---|---|---|
+| 桌面端或本地工作区服务 | 文件只有本地路径，没有公网 URL | multipart 上传托管 | 业务服务主动把文件推到 Gateway，Gateway 临时托管原文件和编辑后文件。 |
+| 线上部署服务 | 文件可通过 HTTPS 域名访问 | `source_url` 直连 | 业务服务只把短时效 HTTPS 读取地址交给 Gateway，原文件和最终保存仍由业务服务自己管理。 |
+| 多个业务服务并存 | 各自管理自己的文档 | 同一个 Gateway，多服务注册 | 每个服务用自己的 `service_id`、RSA 公钥、webhook 白名单和回写逻辑隔离。 |
 
 ## 快速开始
 
@@ -55,6 +65,7 @@ ONLYOFFICE Docs API 要求每个接入服务自行处理：
 
 ```bash
 cp .env.example .env
+make init-secrets
 ```
 
 编辑 `.env`：
@@ -63,7 +74,10 @@ cp .env.example .env
 # Gateway
 LISTEN_ADDR=0.0.0.0:18080
 DOCUMENT_SERVER_URL=http://localhost:18000
-JWT_SECRET=                          # 与 Document Server 一致
+DOCUMENT_SERVER_JWT_SECRET=          # 仅与 Document Server 一致
+GATEWAY_ADMIN_SESSION_SECRET=        # 仅管理端 Session JWT
+GATEWAY_CALLBACK_CAPABILITY_SECRET=  # 仅 Document Server callback capability
+WEBHOOK_SECRET_ENCRYPTION_KEY=       # Base64 编码的 32 字节 AES 密钥
 STORAGE_DIR=./data/storage
 TTL_HOURS=8
 CLEANUP_INTERVAL=1h
@@ -99,11 +113,12 @@ make frontend-dev
 
 ### 3. 通过管理端注册业务服务
 
-打开 `http://localhost:5173/admin/login`，登录后：
+打开 `http://localhost:16666/admin/login`，登录后：
 
 1. 点击 **Add Service**
 2. 填入 Service ID、RSA 公钥（PEM 格式）、Webhook 域名白名单
-3. 提交后立即生效，无需重启 Gateway
+3. 提交后立即复制只展示一次的 Webhook Secret，并配置到对应业务服务
+4. 服务注册立即生效，无需重启 Gateway
 
 ### 4. 生成 RSA 密钥对（业务服务）
 
@@ -179,17 +194,20 @@ import { OnlyOfficeEditor } from "@zenmind/onlyoffice-editor";
 | `POST` | `/admin/api/services` | Bearer | 新增业务服务 |
 | `PUT` | `/admin/api/services/{id}` | Bearer | 更新业务服务 |
 | `DELETE` | `/admin/api/services/{id}` | Bearer | 删除业务服务 |
+| `POST` | `/admin/api/services/{id}/webhook-secret/rotate` | Bearer | 生成待切换凭证，只返回一次明文 |
+| `POST` | `/admin/api/services/{id}/webhook-secret/activate` | Bearer | 激活待切换凭证 |
+| `POST` | `/admin/api/services/{id}/webhook-secret/rollback` | Bearer | 十分钟窗口内回滚凭证 |
 
-Admin API 使用 HMAC-SHA256 JWT 认证（复用 `JWT_SECRET`），24h 过期。
+Admin API 使用 `GATEWAY_ADMIN_SESSION_SECRET` 签发 HMAC-SHA256 Session JWT，24h 过期。创建服务和轮换凭证时返回的 service webhook secret 只展示一次；业务服务只保存自己的 secret，不应获得 `DOCUMENT_SERVER_JWT_SECRET`。
 
 ### POST /api/v1/documents
 
-Gateway 支持两种文件接入模式；同一服务可按文档选择使用。
+Gateway 支持两种文件接入模式；同一服务可按文档选择使用。模式是文件进入编辑会话的方式，不是两套 Gateway 架构。
 
 | 场景 | 推荐模式 | Gateway 是否保存文件 | 结果获取方式 |
 |---|---|---|---|
-| 业务服务没有对象存储，或希望 Gateway 临时托管文件 | multipart 上传托管 | 保存原文件和编辑后文件，按 TTL 清理 | webhook 后调用 `GET /api/v1/documents/{id}` |
-| 业务服务已将文件存在 S3/对象存储 | `source_url` 直连 | 只保存元数据，不保存文件字节 | webhook 中读取 `edited_url` 并立即保存回业务 S3 |
+| 桌面端、本地工作区、无公网 HTTPS 文件地址 | multipart 上传托管 | 保存原文件和编辑后文件，按 TTL 清理 | webhook 后调用 `GET /api/v1/documents/{id}`，再写回业务侧文件系统或存储 |
+| 线上部署服务，文件已有公网 HTTPS 读取地址 | `source_url` 直连 | 只保存元数据，不保存文件字节 | webhook 中读取 `edited_url` 并立即保存回业务侧存储 |
 | 本地/MinIO 只能提供 HTTP URL | multipart 上传托管 | 保存原文件和编辑后文件 | 避免把 HTTP MinIO URL 放入 `source_url` |
 
 #### 模式 A：上传托管（multipart）
@@ -205,7 +223,7 @@ Gateway 支持两种文件接入模式；同一服务可按文档选择使用。
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `service_id` | ✅ | 服务标识 |
-| `webhook_url` | ✅ | 编辑完成回调地址 |
+| `webhook_url` | | 编辑完成回调地址；提供时该 service 必须已有 active webhook credential，否则返回 422；省略时不会投递业务 webhook |
 | `external_id` | | 业务侧文档 ID |
 | `file_name` | | 文件名 |
 | `document_type` | | `word` / `cell` / `slide` / `pdf` |
@@ -213,9 +231,9 @@ Gateway 支持两种文件接入模式；同一服务可按文档选择使用。
 | `config_overrides` | | ONLYOFFICE config 完全覆盖 |
 | `exp` | ✅ | 上传 token 有效期，控制调用 API 的时间窗口。生成后应立即使用，建议 60s 以防范重放 |
 
-#### 模式 B：业务 S3 直连（`source_url`）
+#### 模式 B：业务 URL 直连（`source_url`）
 
-适用于业务服务已管理 S3（或其他对象存储）的场景。将短时效、可由 Document Server 访问的预签名 **GET** URL 放入已签名 JWT 的 `source_url` claim，并以空请求体调用同一端点。Gateway 只保存编辑会话元数据，不接收、复制或清理原文件；ONLYOFFICE 直接下载该 URL。
+适用于业务服务已管理文件，并且能提供 Document Server 可访问的短时效 HTTPS **GET** URL 的场景。该 URL 可以来自业务域名、对象存储或预签名地址；放入已签名 JWT 的 `source_url` claim，并以空请求体调用同一端点。Gateway 只保存编辑会话元数据，不接收、复制或清理原文件；ONLYOFFICE 直接下载该 URL。
 
 ```javascript
 const token = jwt.sign({
@@ -231,7 +249,7 @@ await fetch(`${gatewayUrl}/api/v1/documents`, {
 });
 ```
 
-`source_url` 必须覆盖编辑会话期间 Document Server 的读取需求，必须是 HTTPS URL，且不可包含用户名/密码或指向仅浏览器可访问的内网地址。业务服务负责原文件和最终文件的 S3 生命周期策略；Gateway 在该模式下只保存会话元数据，不会下载或清理业务 S3 中的对象。
+`source_url` 必须覆盖编辑会话期间 Document Server 的读取需求，必须是 HTTPS URL，且不可包含用户名/密码或指向仅浏览器可访问的内网地址。业务服务负责原文件和最终文件的生命周期策略；Gateway 在该模式下只保存会话元数据，不会下载或清理业务侧对象。
 
 ### 编辑器定制
 
@@ -248,12 +266,17 @@ Layer 3: config_overrides（完全穿透覆盖）
 ```
 POST <webhook_url>
 X-Gateway-Event: document.saved
-X-Gateway-Signature: sha256=<HMAC(url+body, jwt_secret)>
+X-Gateway-Service-Id: <service_id>
+X-Gateway-Timestamp: <unix-seconds>
+X-Gateway-Delivery-Id: <stable-delivery-id>
+X-Gateway-Signature: v1=<lowercase-hex-hmac-sha256>
 
 { "event": "document.saved", "document_id": "doc_xxx", "status": "ready", "edited_url": "..." }
 ```
 
-在 S3 直连模式下，`edited_url` 是 ONLYOFFICE 提供的短时效下载地址；Gateway 不读取其内容，业务服务必须在收到 webhook 后立即下载并保存回自己的对象存储。在 multipart 模式下，该字段为空，业务侧仍可使用 `GET /api/v1/documents/{id}` 获取 Gateway 保存的结果。
+签名原文是 `v1\n<service_id>\n<timestamp>\n<delivery_id>\n<raw_body>`，密钥是该 service 独立的 webhook secret。业务服务应在解析 JSON 前对原始 body 验签，并限制时间戳偏差（建议 300 秒）。
+
+在 `source_url` 直连模式下，`edited_url` 是 ONLYOFFICE 提供的短时效下载地址；Gateway 不读取其内容，业务服务必须在收到 webhook 后立即下载并保存回自己的文件系统或对象存储。在 multipart 模式下，该字段为空，业务侧仍可使用 `GET /api/v1/documents/{id}` 获取 Gateway 保存的结果。
 
 直连模式下业务 webhook 的推荐处理流程：
 
@@ -264,7 +287,7 @@ app.post('/onlyoffice/webhook', async (req, res) => {
   if (edited_url) {
     const edited = await fetch(edited_url);
     if (!edited.ok) throw new Error(`download edited file failed: ${edited.status}`);
-    await putObjectToBusinessS3(external_id || document_id, edited.body);
+    await saveToBusinessStorage(external_id || document_id, edited.body);
   } else {
     await copyFromGatewayResult(document_id);
   }
@@ -272,7 +295,7 @@ app.post('/onlyoffice/webhook', async (req, res) => {
 });
 ```
 
-Gateway 对 Webhook 做有限重试（3 次，指数退避并附加短 jitter），失败后记录指标和日志。保存任务会先进入有界队列，队列大小由 `CALLBACK_QUEUE_SIZE` 控制，worker 数由 `CALLBACK_WORKERS` 控制。收到 `SIGTERM` 或 `SIGINT` 后，Gateway 会先停止 HTTP 接入，再停止本地清理调度并排空已入队的保存任务。
+Gateway 对 Webhook 做有限重试（默认最多重试 3 次，即首次投递之外最多再尝试 3 次），退避附加短 jitter。网络错误、408、429、5xx 会重试，其他 4xx 视为永久失败；最终失败会记录指标和日志。保存任务会先进入有界队列，队列大小由 `CALLBACK_QUEUE_SIZE` 控制，worker 数由 `CALLBACK_WORKERS` 控制。收到 `SIGTERM` 或 `SIGINT` 后，Gateway 会先停止 HTTP 接入，再停止本地清理调度并排空已入队的保存任务。
 
 保存回调中，Gateway 会从 Document Server 回调体的 `url` 下载编辑后文件并保存为最新版。该下载和 Webhook 投递共用带连接池的 HTTP client，支持 keep-alive 和连接复用，降低高并发保存时的连接建立开销。
 
@@ -299,7 +322,8 @@ make frontend-dev
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少设置 JWT_SECRET 和 ADMIN_PASSWORD
+make init-secrets
+# 编辑 .env，至少设置 ADMIN_PASSWORD；init-secrets 不覆盖已有值
 docker compose up -d
 ```
 
@@ -313,7 +337,10 @@ docker compose up -d
 |---|---|---|
 | `LISTEN_ADDR` | `:18080` | 监听地址 |
 | `DOCUMENT_SERVER_URL` | — | Document Server 地址 |
-| `JWT_SECRET` | — | 与 Document Server 共用 |
+| `DOCUMENT_SERVER_JWT_SECRET` | — | 仅 Gateway 与 Document Server 共用的编辑器配置 JWT secret |
+| `GATEWAY_ADMIN_SESSION_SECRET` | — | 仅 Gateway 管理端 Session JWT 使用 |
+| `GATEWAY_CALLBACK_CAPABILITY_SECRET` | — | 仅 Gateway callback capability 使用 |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | — | Base64 编码的 32 字节 AES-256-GCM 主密钥，用于加密 service webhook secret |
 | `STORAGE_BACKEND` | `local` | 文件存储后端：`local` / `s3` |
 | `STORAGE_DIR` | `./data/storage` | 文件存储路径 |
 | `S3_ENDPOINT` | — | S3/MinIO endpoint，MinIO 示例：`http://minio:9000` |
@@ -326,7 +353,7 @@ docker compose up -d
 | `S3_PREFIX` | — | 对象 key 前缀，例如 `documents` |
 | `TTL_HOURS` | `8` | 文档存活时间 |
 | `CLEANUP_INTERVAL` | `1h` | 本地存储过期文档清理间隔，仅 `STORAGE_BACKEND=local` 生效；环境变量和 YAML 均支持 `15m`、`1h` 格式 |
-| `WEBHOOK_MAX_RETRIES` | `3` | Webhook 最大重试次数 |
+| `WEBHOOK_MAX_RETRIES` | `3` | Webhook 在首次投递之外的最大重试次数 |
 | `CALLBACK_QUEUE_SIZE` | `64` | 保存回调有界队列长度 |
 | `CALLBACK_WORKERS` | `4` | 保存回调并发 worker 数 |
 | `ADMIN_USERNAME` | `admin` | 管理端用户名 |
@@ -357,7 +384,7 @@ make frontend-dev     # 启动管理端 dev server
 | 层 | 技术 |
 |---|---|
 | 后端 | Go 1.22+, 标准库 HTTP router |
-| 认证 | JWT RS256（服务自签）+ HMAC（webhook 签名 + admin session） |
+| 认证 | JWT RS256（服务自签）+ 分离的 Document Server JWT、callback capability、admin session 与每服务 webhook HMAC |
 | 存储 | 本地磁盘 / S3-compatible 对象存储（MinIO、AWS S3） |
 | 管理端 | React 18 + Vite + shadcn/ui |
 | SDK | React 18, TypeScript, Vitest + jsdom |

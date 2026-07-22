@@ -58,16 +58,16 @@
 | # | 决策项 | 选择 | 理由 |
 |---|---|---|---|
 | 1 | Gateway 部署形态 | **独立 Gateway 服务** | 一个实例服务所有业务，无需改 Document Server |
-| 2 | 文档交换模型 | **推-拉**（服务推文件 → 编辑完 → 服务拉回） | 服务不需要暴露任何文件接口 |
-| 3 | 通知机制 | **Webhook 优先 + SSE 备用** | 实时性好，SSE 作为降级通道 |
-| 4 | 文档上传方式 | **POST multipart 直接上传** | 不要求服务暴露文件 URL |
-| 5 | 文档存储 | **本地磁盘 + 预留对象存储接口** | 先简单落地，接口层预留 S3 扩展 |
+| 2 | 文档交换模型 | **按文档选择 hosted multipart 或 direct `source_url`** | 本地文件可推送托管，已有 HTTPS 文件可保持业务侧存储所有权 |
+| 3 | 通知机制 | **业务 Webhook**；hosted 模式可主动拉取结果 | 当前没有 SSE 接口；direct-source 结果必须在 webhook 中及时保存 |
+| 4 | 文档接入方式 | **同一 `POST /api/v1/documents` 的两种 ingress mode** | 不为不同业务形态拆分 Gateway 架构 |
+| 5 | 文档存储 | **hosted 支持本地磁盘或 S3；direct-source 仅存元数据** | Gateway 只管理自己托管的临时对象 |
 | 6 | 文档 TTL | **8 小时** | 超时自动清理，清理前服务可多次拉取 |
 | 7 | 服务认证 | **JWT 自签 + 公钥验签 + 域名白名单** | 服务自治，Gateway 不引入用户体系 |
 | 8 | 编辑器呈现 | **Gateway 独立编辑器页 → iframe 内嵌** | 服务前端只需一行 iframe |
 | 9 | 编辑器定制 | **有限定制 + 分层 merge → 预留完全 override** | 品牌适配能力强，扩展时零改动 |
 | 10 | Gateway 权限边界 | **服务级别**（不触及用户体系） | 最小认知模型 |
-| 11 | Webhook 重试 | **有限重试 3 次（指数退避）→ 静默** | 不无限重试，失败后服务轮询兜底 |
+| 11 | Webhook 重试 | **默认最多重试 3 次，按响应分类** | 网络错误、408、429、5xx 重试；其他 4xx 永久失败 |
 | 12 | 前端 SDK | **极薄 npm 包**（`<OnlyOfficeEditor>`） | 单组件封装 iframe + postMessage |
 
 ---
@@ -132,10 +132,16 @@
 
 #### 3.2.1 文档上传
 
+Gateway 不按桌面端/线上服务拆两套架构。业务服务统一调用 `POST /api/v1/documents` 创建编辑会话，并按文档选择接入模式：
+
+- **multipart 上传托管**：适用于桌面端、本地工作区、没有公网 HTTPS 文件地址的服务。业务服务主动上传文件字节，Gateway 临时保存原文件和编辑结果。
+- **`source_url` 直连**：适用于线上服务已能提供 Document Server 可访问的短时效 HTTPS GET URL。Gateway 只保存会话元数据，不复制业务文件。
+
 ```
 业务服务 → POST /api/v1/documents
   Headers:  Authorization: Bearer <JWT>
-  Body:     multipart/form-data { file: <binary>, meta: <JSON> }
+  Body A:   multipart/form-data { file: <binary>, meta: <JSON> }
+  Body B:   empty body + JWT source_url claim
 
 JWT payload:
   {
@@ -145,6 +151,7 @@ JWT payload:
     "user":         { "id": "u-123", "name": "张三" },
     "file_name":    "合同模板.docx",
     "document_type": "word",          // word | cell | slide | pdf
+    "source_url":    "https://biz.example.com/files/contract.docx?token=...", // 直连模式可选
     "branding": {                     // 有限定制 (可选)
       "logo_url":    "https://crm.mycompany.com/logo.png",
       "color_theme": "#1a73e8",
@@ -161,6 +168,8 @@ Gateway 响应:
     "expires_at":  "2026-07-02T22:00:00Z"
   }
 ```
+
+多个业务服务可以共用同一个 Gateway，但各自管理自己的文档存储和保存逻辑。Gateway 在 multipart 模式中只是临时编辑存储，在 `source_url` 模式中只是协议编排和会话元数据存储。
 
 #### 3.2.2 编辑器打开
 
@@ -217,12 +226,9 @@ Gateway → 返回编辑后的文件二进制
 
 #### 3.2.4 Webhook 重试
 
-```
-第 1 次失败 → 等待 2s → 重试
-第 2 次失败 → 等待 5s → 重试
-第 3 次失败 → 等待 10s → 重试
-第 4 次失败 → 放弃。文档标记为 edited，等服务主动轮询 GET 拉取。
-```
+默认 `WEBHOOK_MAX_RETRIES=3`，含首次投递最多尝试 4 次。三次重试分别在约 1s、2s、4s 的指数退避后执行，并各附加最多 250ms jitter。网络错误、408、429、5xx 才会进入重试；其他 4xx 立即视为永久失败。
+
+hosted multipart 的编辑结果在投递 webhook 前已经保存到 Gateway，业务服务可稍后主动 `GET /api/v1/documents/{id}`。direct-source 模式不在 Gateway 保存结果字节，业务服务必须通过成功处理 webhook 中的短时效 `edited_url` 完成持久化，不能依赖 Gateway 轮询兜底。
 
 ---
 
@@ -245,7 +251,7 @@ Gateway → 返回编辑后的文件二进制
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `service_id` | string | ✅ | 服务标识，对应 Gateway 配置中的 service |
-| `webhook_url` | string | ✅ | 编辑完成后的回调地址，域名必须在白名单内 |
+| `webhook_url` | string | | 编辑完成后的回调地址；提供时域名必须在白名单内，且 service 必须有 active webhook credential；省略时不投递业务 webhook |
 | `external_id` | string | | 业务侧的文档标识 |
 | `user.id` | string | | 编辑者 ID |
 | `user.name` | string | | 编辑者名称 |
@@ -389,7 +395,7 @@ Gateway 返回一个完整的 HTML 页面，内嵌 ONLYOFFICE 编辑器。页面
 1. 从 `editor_jwt` 解析 `document_id`
 2. 从 storage 获取文档 meta
 3. 构建完整 ONLYOFFICE config（三层 merge）
-4. 签名 config（JWT，用 Gateway 的 JWT secret）
+4. 签名 config（JWT，仅使用 `DOCUMENT_SERVER_JWT_SECRET`）
 5. 渲染 `<script src="doc-server/.../api.js">`
 6. 初始化 `DocsAPI.DocEditor("placeholder", config)`
 7. postMessage 到父窗口：
@@ -406,7 +412,10 @@ POST <webhook_url>
 Headers:
   Content-Type: application/json
   X-Gateway-Event: document.saved
-  X-Gateway-Signature: sha256=<HMAC(webhook_url + body, service_jwt_secret)>
+  X-Gateway-Service-Id: <service_id>
+  X-Gateway-Timestamp: <unix-seconds>
+  X-Gateway-Delivery-Id: <stable-delivery-id>
+  X-Gateway-Signature: v1=<lowercase-hex-hmac-sha256>
 
 Body:
 {
@@ -414,19 +423,21 @@ Body:
   "document_id": "doc_abc123def456",
   "external_id": "contract-2024-001",
   "status": "ready",
-  "file_type": "docx",
-  "file_size_bytes": 45678,
-  "edited_at": "2026-07-02T14:30:00Z"
+  "edited_url": "https://document-server/..."
 }
 ```
 
-**签名校验**（业务服务侧）:
+`edited_url` 只在 `source_url` 直连模式中传递；multipart 托管模式为空，业务服务通过 `GET /api/v1/documents/{id}` 拉取 Gateway 保存的最新版。
+
+**Webhook v1 签名校验**（业务服务侧）:
 ```
-payload = webhook_url + raw_body
-expected = HMAC-SHA256(payload, <service_jwt_secret>)
-actual   = X-Gateway-Signature header (sha256=...)
-verify(expected == actual)
+signing_input = "v1\n" + service_id + "\n" + timestamp + "\n" + delivery_id + "\n" + raw_body
+expected = hex(HMAC-SHA256(<该 service 的 webhook_secret>, signing_input))
+actual   = X-Gateway-Signature 去掉 "v1=" 前缀后的值
+constant_time_verify(expected, actual)
 ```
+
+业务服务应在解析 JSON 前验证 service ID、时间戳偏差、delivery ID 和原始 body 签名。同一事件重试保持 delivery ID 不变，每次更新 timestamp 和签名。网络错误、408、429、5xx 重试；其他 4xx 不重试。
 
 ---
 
@@ -507,10 +518,10 @@ SELECT * FROM meta WHERE expires_at < NOW()
 | **传输** | HTTPS | 所有业务服务 → Gateway 通信走 TLS |
 | **服务认证** | JWT (RS256) 自签 + Gateway 公钥验签 | 每个服务的 RSA 公钥预配置在 Gateway 中 |
 | **域名白名单** | `allowed_webhook_domains` | Gateway 校验 webhook_url 域名，防止 JWT 泄露后任意回调 |
-| **ONLYOFFICE 签名** | JWT (HS256) | Gateway 用共享密钥签 ONLYOFFICE config |
-| **Webhook 防伪** | HMAC-SHA256 签名（`X-Gateway-Signature`） | 服务可验证 webhook 来自 Gateway |
-| **文件访问** | `/download/{docId}` 仅 Document Server 可达 | 不暴露给公开访问 |
-| **文档隔离** | 每个 document_id 独立目录 | 跨服务不互相串读 |
+| **ONLYOFFICE 签名** | JWT (HS256) | Gateway 仅用与 Document Server 共享的 `DOCUMENT_SERVER_JWT_SECRET` 签 config |
+| **Webhook 防伪** | 每服务独立凭证 + Webhook v1 HMAC-SHA256 | 服务可验证 webhook 来自 Gateway，且一个服务的凭证不能伪造其他服务 |
+| **文件访问** | `/download/{docId}` 与业务下载路由由部署网络保护 | 当前 handler 不做调用方身份认证，生产环境必须限制暴露面 |
+| **文档隔离** | 每个 document ID 独立存储键 | ID 随机不可预测，但当前下载 API 不提供 service 级授权边界 |
 | **最小暴露** | Gateway 只监听内网地址或通过反向代理 | 不直接暴露到公网 |
 | **TTL 清理** | 8 小时自动过期 | 防止磁盘耗尽 |
 
@@ -520,29 +531,17 @@ SELECT * FROM meta WHERE expires_at < NOW()
 # gateway.yaml
 listen_addr: "127.0.0.1:18080"
 document_server_url: "https://doc.zenmind.cc"
-jwt_secret: "your-onlyoffice-document-server-jwt-secret"
+document_server_jwt_secret: "<独立随机值>"
+gateway_admin_session_secret: "<独立随机值>"
+gateway_callback_capability_secret: "<独立随机值>"
+webhook_secret_encryption_key: "<Base64 编码的 32 字节值>"
+storage_backend: "local"
 storage_dir: "./data/storage"
 ttl_hours: 8
 webhook_max_retries: 3
-
-services:
-  - id: "crm-service"
-    public_key: |
-      -----BEGIN RSA PUBLIC KEY-----
-      MIIBCgKCAQEA...
-      -----END RSA PUBLIC KEY-----
-    allowed_webhook_domains:
-      - "crm.mycompany.com"
-      - "crm-staging.mycompany.com"
-
-  - id: "doc-platform"
-    public_key: |
-      -----BEGIN RSA PUBLIC KEY-----
-      MIIBCgKCAQEA...
-      -----END RSA PUBLIC KEY-----
-    allowed_webhook_domains:
-      - "docs.mycompany.com"
 ```
+
+Service 不从 YAML 加载。管理员通过 `/admin/api/services` 或管理 UI 写入持久化 service registry；创建响应会一次性返回该 service 的 webhook credential。
 
 ### 6.2 业务服务接入流程
 
@@ -551,7 +550,7 @@ services:
    openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
    openssl rsa -pubout -in private.pem -out public.pem
 
-2. 将公钥提供给 Gateway 管理员，写入 gateway.yaml
+2. Gateway 管理员通过管理 UI 注册 service、公钥和 webhook 域名白名单，并把创建响应一次性展示的 webhook secret 安全交付给该业务服务
 
 3. 上传文档时用私钥签 JWT:
    const token = jwt.sign({
@@ -714,7 +713,10 @@ services:
       - "18080:18080"
     environment:
       DOCUMENT_SERVER_URL: http://document-server
-      JWT_SECRET: ${JWT_SECRET}
+      DOCUMENT_SERVER_JWT_SECRET: ${DOCUMENT_SERVER_JWT_SECRET}
+      GATEWAY_ADMIN_SESSION_SECRET: ${GATEWAY_ADMIN_SESSION_SECRET}
+      GATEWAY_CALLBACK_CAPABILITY_SECRET: ${GATEWAY_CALLBACK_CAPABILITY_SECRET}
+      WEBHOOK_SECRET_ENCRYPTION_KEY: ${WEBHOOK_SECRET_ENCRYPTION_KEY}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       SERVICE_STORE_PATH: /app/data/services.json
@@ -732,11 +734,11 @@ volumes:
 
 | 风险 | 概率 | 缓解 |
 |---|---|---|
-| Gateway 单点故障 | 中 | 可水平扩展（无状态 + 共享存储），前端 LB |
+| Gateway 单点故障 | 中 | 当前 service registry 与审计日志为实例本地状态；先做持久卷和备份，高可用需另行设计共享控制面，不能直接按无状态服务扩容 |
 | 大文件上传 OOM | 低 | multipart stream → 直接写盘，不缓冲到内存 |
-| Webhook 不可达导致通知丢失 | 低 | 重试 3 次 + 服务轮询兜底 |
+| Webhook 不可达导致通知丢失 | 低 | 分类重试与失败指标；hosted 模式可主动拉取，direct-source 模式必须保证接收端高可用并及时保存 `edited_url` |
 | 存储磁盘占满 | 中 | TTL 8h 自动清理 + 磁盘水位告警 |
-| JWT 密钥泄露 | 低 | 服务自行轮换密钥，Gateway 配置更新公钥 |
+| 密钥泄露 | 低 | RS256 服务密钥与四个 Gateway 信任域分离；业务服务只持有自己的 webhook credential，按 pending/activate/rollback 流程轮换 |
 
 ---
 

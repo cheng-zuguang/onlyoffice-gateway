@@ -19,10 +19,11 @@ func TestRootHandlerLogsAdminAPIRequests(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(previous) })
 
 	cfg := &config.Config{
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-secret",
-		StorageDir:        t.TempDir(),
-		WebhookMaxRetries: 3,
+		DocumentServerURL:        "https://doc.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0002",
+		CallbackCapabilitySecret: "test-callback-capability-secret-02",
+		StorageDir:               t.TempDir(),
+		WebhookMaxRetries:        3,
 	}
 	store := admin.NewInMemoryServiceStore()
 	handler := newRootHandler(cfg, store, "admin", "admin123")
@@ -50,10 +51,11 @@ func TestRootHandlerLogsGatewayAPIRequestsOnce(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(previous) })
 
 	cfg := &config.Config{
-		DocumentServerURL: "https://doc.example.com",
-		JWTSecret:         "test-secret",
-		StorageDir:        t.TempDir(),
-		WebhookMaxRetries: 3,
+		DocumentServerURL:        "https://doc.example.com",
+		DocumentServerJWTSecret:  "test-document-server-secret-0002",
+		CallbackCapabilitySecret: "test-callback-capability-secret-02",
+		StorageDir:               t.TempDir(),
+		WebhookMaxRetries:        3,
 	}
 	store := admin.NewInMemoryServiceStore()
 	handler := newRootHandler(cfg, store, "admin", "admin123")

@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,16 +47,17 @@ type CallbackBody struct {
 }
 
 type CallbackHandler struct {
-	store             storage.Store
-	webhookMaxRetries int
-	webhookHMACSecret string
-	debounce          map[string]*time.Timer
-	debounceMu        sync.Mutex
-	saveJobs          chan CallbackBody
-	enqueueMu         sync.Mutex
-	closed            bool
-	workers           sync.WaitGroup
-	metrics           CallbackMetrics
+	store                    storage.Store
+	webhookMaxRetries        int
+	callbackCapabilitySecret string
+	credentialResolver       WebhookCredentialResolver
+	debounce                 map[string]*time.Timer
+	debounceMu               sync.Mutex
+	saveJobs                 chan CallbackBody
+	enqueueMu                sync.Mutex
+	closed                   bool
+	workers                  sync.WaitGroup
+	metrics                  CallbackMetrics
 }
 
 type CallbackOptions struct {
@@ -63,11 +65,11 @@ type CallbackOptions struct {
 	Workers   int
 }
 
-func NewCallbackHandler(store storage.Store, maxRetries int, hmacSecret string) *CallbackHandler {
-	return NewCallbackHandlerWithOptions(store, maxRetries, hmacSecret, CallbackOptions{})
+func NewCallbackHandler(store storage.Store, maxRetries int, callbackCapabilitySecret string, credentialResolver WebhookCredentialResolver) *CallbackHandler {
+	return NewCallbackHandlerWithOptions(store, maxRetries, callbackCapabilitySecret, credentialResolver, CallbackOptions{})
 }
 
-func NewCallbackHandlerWithOptions(store storage.Store, maxRetries int, hmacSecret string, opts CallbackOptions) *CallbackHandler {
+func NewCallbackHandlerWithOptions(store storage.Store, maxRetries int, callbackCapabilitySecret string, credentialResolver WebhookCredentialResolver, opts CallbackOptions) *CallbackHandler {
 	if opts.QueueSize <= 0 {
 		opts.QueueSize = 64
 	}
@@ -75,11 +77,12 @@ func NewCallbackHandlerWithOptions(store storage.Store, maxRetries int, hmacSecr
 		opts.Workers = 4
 	}
 	h := &CallbackHandler{
-		store:             store,
-		webhookMaxRetries: maxRetries,
-		webhookHMACSecret: hmacSecret,
-		debounce:          make(map[string]*time.Timer),
-		saveJobs:          make(chan CallbackBody, opts.QueueSize),
+		store:                    store,
+		webhookMaxRetries:        maxRetries,
+		callbackCapabilitySecret: callbackCapabilitySecret,
+		credentialResolver:       credentialResolver,
+		debounce:                 make(map[string]*time.Timer),
+		saveJobs:                 make(chan CallbackBody, opts.QueueSize),
 	}
 	for i := 0; i < opts.Workers; i++ {
 		h.workers.Add(1)
@@ -153,7 +156,7 @@ func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"error": 1, "message": "invalid json"})
 		return
 	}
-	if !validCallbackCapability(body.Key, r.URL.Query().Get("token"), h.webhookHMACSecret) {
+	if !validCallbackCapability(body.Key, r.URL.Query().Get("token"), h.callbackCapabilitySecret) {
 		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"error": 1, "message": "invalid callback token"})
 		return
 	}
@@ -262,6 +265,17 @@ func (h *CallbackHandler) deliverWebhook(documentID, editedURL string) {
 	if err != nil || meta.WebhookURL == "" {
 		return
 	}
+	if h.credentialResolver == nil {
+		log.Printf("[webhook] missing credential resolver: doc=%s service=%s", documentID, meta.ServiceID)
+		h.metrics.WebhookFailedTotal.Add(1)
+		return
+	}
+	secret, ok := h.credentialResolver.ActiveWebhookSecret(meta.ServiceID)
+	if !ok {
+		log.Printf("[webhook] active credential missing: doc=%s service=%s", documentID, meta.ServiceID)
+		h.metrics.WebhookFailedTotal.Add(1)
+		return
+	}
 
 	payload, _ := json.Marshal(map[string]interface{}{
 		"event":       "document.saved",
@@ -271,8 +285,7 @@ func (h *CallbackHandler) deliverWebhook(documentID, editedURL string) {
 		"edited_url":  editedURL,
 	})
 
-	// HMAC signature: sha256(webhook_url + body, secret)
-	sig := computeHMAC(meta.WebhookURL+string(payload), h.webhookHMACSecret)
+	deliveryID := "delivery_" + randomString(24)
 
 	for attempt := 0; attempt <= h.webhookMaxRetries; attempt++ {
 		if attempt > 0 {
@@ -280,24 +293,43 @@ func (h *CallbackHandler) deliverWebhook(documentID, editedURL string) {
 			backoff += time.Duration(rand.Int63n(int64(250 * time.Millisecond)))
 			time.Sleep(backoff)
 		}
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		signingInput := "v1\n" + meta.ServiceID + "\n" + timestamp + "\n" + deliveryID + "\n" + string(payload)
+		sig := computeHMAC(signingInput, secret)
 		req, _ := http.NewRequest("POST", meta.WebhookURL, bytes.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Gateway-Signature", "sha256="+sig)
+		req.Header.Set("X-Gateway-Service-Id", meta.ServiceID)
+		req.Header.Set("X-Gateway-Timestamp", timestamp)
+		req.Header.Set("X-Gateway-Delivery-Id", deliveryID)
+		req.Header.Set("X-Gateway-Signature", "v1="+sig)
 		req.Header.Set("X-Gateway-Event", "document.saved")
 		resp, err := callbackHTTPClient.Do(req)
-		if err == nil && resp.StatusCode < 400 {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
 			resp.Body.Close()
+		}
+		if err == nil && status >= http.StatusOK && status < http.StatusMultipleChoices {
 			log.Printf("[webhook] delivered: doc=%s attempt=%d", documentID, attempt)
 			h.metrics.WebhookSucceededTotal.Add(1)
 			return
 		}
-		if resp != nil {
-			resp.Body.Close()
+		if !shouldRetryWebhook(status, err) {
+			log.Printf("[webhook] permanent failure: doc=%s attempt=%d status=%d", documentID, attempt, status)
+			h.metrics.WebhookFailedTotal.Add(1)
+			return
 		}
-		log.Printf("[webhook] failed: doc=%s attempt=%d err=%v", documentID, attempt, err)
+		log.Printf("[webhook] retryable failure: doc=%s attempt=%d status=%d err=%v", documentID, attempt, status, err)
 	}
 	log.Printf("[webhook] giving up: doc=%s", documentID)
 	h.metrics.WebhookFailedTotal.Add(1)
+}
+
+func shouldRetryWebhook(status int, err error) bool {
+	if err != nil {
+		return true
+	}
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 }
 
 func computeHMAC(data, secret string) string {

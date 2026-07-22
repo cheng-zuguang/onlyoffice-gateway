@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,28 +13,31 @@ import (
 )
 
 type Config struct {
-	ListenAddr              string        `yaml:"listen_addr"`
-	DocumentServerURL       string        `yaml:"document_server_url"`
-	DocumentServerPublicURL string        `yaml:"document_server_public_url"`
-	JWTSecret               string        `yaml:"jwt_secret"`
-	StorageBackend          string        `yaml:"storage_backend"`
-	StorageDir              string        `yaml:"storage_dir"`
-	S3Endpoint              string        `yaml:"s3_endpoint"`
-	S3Region                string        `yaml:"s3_region"`
-	S3Bucket                string        `yaml:"s3_bucket"`
-	S3AccessKey             string        `yaml:"s3_access_key"`
-	S3SecretKey             string        `yaml:"s3_secret_key"`
-	S3UsePathStyle          bool          `yaml:"s3_use_path_style"`
-	S3UseSSL                bool          `yaml:"s3_use_ssl"`
-	S3Prefix                string        `yaml:"s3_prefix"`
-	MaxUploadBytes          int64         `yaml:"max_upload_bytes"`
-	TTLHours                int           `yaml:"ttl_hours"`
-	CleanupInterval         time.Duration `yaml:"cleanup_interval"`
-	WebhookMaxRetries       int           `yaml:"webhook_max_retries"`
-	CallbackQueueSize       int           `yaml:"callback_queue_size"`
-	CallbackWorkers         int           `yaml:"callback_workers"`
-	AdminAuditLogDir        string        `yaml:"admin_audit_log_dir"`
-	AdminAuditRetentionDays int           `yaml:"admin_audit_log_retention_days"`
+	ListenAddr                 string        `yaml:"listen_addr"`
+	DocumentServerURL          string        `yaml:"document_server_url"`
+	DocumentServerPublicURL    string        `yaml:"document_server_public_url"`
+	DocumentServerJWTSecret    string        `yaml:"document_server_jwt_secret"`
+	AdminSessionSecret         string        `yaml:"gateway_admin_session_secret"`
+	CallbackCapabilitySecret   string        `yaml:"gateway_callback_capability_secret"`
+	WebhookSecretEncryptionKey string        `yaml:"webhook_secret_encryption_key"`
+	StorageBackend             string        `yaml:"storage_backend"`
+	StorageDir                 string        `yaml:"storage_dir"`
+	S3Endpoint                 string        `yaml:"s3_endpoint"`
+	S3Region                   string        `yaml:"s3_region"`
+	S3Bucket                   string        `yaml:"s3_bucket"`
+	S3AccessKey                string        `yaml:"s3_access_key"`
+	S3SecretKey                string        `yaml:"s3_secret_key"`
+	S3UsePathStyle             bool          `yaml:"s3_use_path_style"`
+	S3UseSSL                   bool          `yaml:"s3_use_ssl"`
+	S3Prefix                   string        `yaml:"s3_prefix"`
+	MaxUploadBytes             int64         `yaml:"max_upload_bytes"`
+	TTLHours                   int           `yaml:"ttl_hours"`
+	CleanupInterval            time.Duration `yaml:"cleanup_interval"`
+	WebhookMaxRetries          int           `yaml:"webhook_max_retries"`
+	CallbackQueueSize          int           `yaml:"callback_queue_size"`
+	CallbackWorkers            int           `yaml:"callback_workers"`
+	AdminAuditLogDir           string        `yaml:"admin_audit_log_dir"`
+	AdminAuditRetentionDays    int           `yaml:"admin_audit_log_retention_days"`
 }
 
 // UnmarshalYAML accepts the human-readable duration syntax used by environment
@@ -109,8 +113,17 @@ func Load(path string) (*Config, error) {
 }
 
 func applyEnvOverrides(cfg *Config) (*Config, error) {
-	if s := os.Getenv("JWT_SECRET"); s != "" {
-		cfg.JWTSecret = s
+	if s := os.Getenv("DOCUMENT_SERVER_JWT_SECRET"); s != "" {
+		cfg.DocumentServerJWTSecret = s
+	}
+	if s := os.Getenv("GATEWAY_ADMIN_SESSION_SECRET"); s != "" {
+		cfg.AdminSessionSecret = s
+	}
+	if s := os.Getenv("GATEWAY_CALLBACK_CAPABILITY_SECRET"); s != "" {
+		cfg.CallbackCapabilitySecret = s
+	}
+	if s := os.Getenv("WEBHOOK_SECRET_ENCRYPTION_KEY"); s != "" {
+		cfg.WebhookSecretEncryptionKey = s
 	}
 	if s := os.Getenv("LISTEN_ADDR"); s != "" {
 		cfg.ListenAddr = s
@@ -240,8 +253,34 @@ func FromLiteral(cfg *Config) (*Config, error) {
 
 // Validate verifies the configuration values required to safely serve requests.
 func (cfg *Config) Validate() error {
-	if strings.TrimSpace(cfg.JWTSecret) == "" {
-		return fmt.Errorf("JWT_SECRET is required")
+	secrets := []struct {
+		name  string
+		value string
+	}{
+		{"DOCUMENT_SERVER_JWT_SECRET", cfg.DocumentServerJWTSecret},
+		{"GATEWAY_ADMIN_SESSION_SECRET", cfg.AdminSessionSecret},
+		{"GATEWAY_CALLBACK_CAPABILITY_SECRET", cfg.CallbackCapabilitySecret},
+	}
+	for _, secret := range secrets {
+		if len(strings.TrimSpace(secret.value)) < 32 {
+			return fmt.Errorf("%s must be at least 32 characters", secret.name)
+		}
+	}
+	if _, err := cfg.WebhookSecretEncryptionKeyBytes(); err != nil {
+		return err
+	}
+	allSecretValues := []string{
+		cfg.DocumentServerJWTSecret,
+		cfg.AdminSessionSecret,
+		cfg.CallbackCapabilitySecret,
+		cfg.WebhookSecretEncryptionKey,
+	}
+	for i := range allSecretValues {
+		for j := i + 1; j < len(allSecretValues); j++ {
+			if allSecretValues[i] == allSecretValues[j] {
+				return fmt.Errorf("gateway secrets must be distinct")
+			}
+		}
 	}
 	if strings.TrimSpace(cfg.DocumentServerURL) == "" {
 		return fmt.Errorf("DOCUMENT_SERVER_URL is required")
@@ -277,4 +316,12 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("unsupported STORAGE_BACKEND %q", cfg.StorageBackend)
 	}
 	return nil
+}
+
+func (cfg *Config) WebhookSecretEncryptionKeyBytes() ([]byte, error) {
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cfg.WebhookSecretEncryptionKey))
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY must be base64 encoding of exactly 32 bytes")
+	}
+	return key, nil
 }
