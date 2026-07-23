@@ -17,7 +17,15 @@ vi.mock('../lib/api', async () => {
 })
 
 describe('ServicesPage webhook credentials', () => {
+  const clipboardWriteText = vi.fn()
+
   beforeEach(() => {
+    clipboardWriteText.mockReset()
+    clipboardWriteText.mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWriteText },
+    })
     vi.mocked(api.listServices).mockResolvedValue([])
     vi.mocked(api.createService).mockResolvedValue({
       service: {
@@ -45,6 +53,47 @@ describe('ServicesPage webhook credentials', () => {
     expect(await screen.findByText('one-time-service-secret')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '我已保存，关闭' }))
     await waitFor(() => expect(screen.queryByText('one-time-service-secret')).not.toBeInTheDocument())
+  })
+
+  it('copies the one-time secret and shows visible success feedback', async () => {
+    const user = userEvent.setup()
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWriteText },
+    })
+    render(<ServicesPage />)
+    await screen.findByText('尚未配置服务')
+
+    await user.click(screen.getByRole('button', { name: '新增服务' }))
+    const form = screen.getByRole('dialog')
+    await user.type(within(form).getByLabelText('服务标识'), 'doc')
+    await user.type(within(form).getByLabelText('RSA Public Key (PEM)'), 'public-key')
+    await user.click(within(form).getByRole('button', { name: '新增服务' }))
+
+    await user.click(await screen.findByRole('button', { name: '复制 Webhook 凭证' }))
+
+    expect(clipboardWriteText).toHaveBeenCalledWith('one-time-service-secret')
+    expect(await screen.findByRole('button', { name: '已复制 Webhook 凭证' })).toBeInTheDocument()
+  })
+
+  it('falls back to the legacy copy command when the Clipboard API is unavailable', async () => {
+    const execCommand = vi.fn().mockReturnValue(true)
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand })
+    const user = userEvent.setup()
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
+    render(<ServicesPage />)
+    await screen.findByText('尚未配置服务')
+
+    await user.click(screen.getByRole('button', { name: '新增服务' }))
+    const form = screen.getByRole('dialog')
+    await user.type(within(form).getByLabelText('服务标识'), 'doc')
+    await user.type(within(form).getByLabelText('RSA Public Key (PEM)'), 'public-key')
+    await user.click(within(form).getByRole('button', { name: '新增服务' }))
+
+    await user.click(await screen.findByRole('button', { name: '复制 Webhook 凭证' }))
+
+    expect(execCommand).toHaveBeenCalledWith('copy')
+    expect(await screen.findByRole('button', { name: '已复制 Webhook 凭证' })).toBeInTheDocument()
   })
 
   it('shows the pending secret returned by rotation without activating it', async () => {

@@ -8,8 +8,36 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import { Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip'
 import { listServices, createService, updateService, deleteService, rotateWebhookSecret, activateWebhookSecret, rollbackWebhookSecret, type Service } from '../lib/api'
-import { Plus, Trash2, Server, Pencil, RefreshCw, Copy, KeyRound, BadgeCheck, RotateCcw } from 'lucide-react'
+import { Plus, Trash2, Server, Pencil, RefreshCw, Copy, Check, CircleAlert, KeyRound, BadgeCheck, RotateCcw } from 'lucide-react'
 import { cn } from '../lib/utils'
+
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // Clipboard API can be blocked on non-HTTPS deployments. Fall back below.
+    }
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  textarea.setSelectionRange(0, text.length)
+
+  try {
+    if (!document.execCommand?.('copy')) {
+      throw new Error('copy command was rejected')
+    }
+  } finally {
+    textarea.remove()
+  }
+}
 
 export default function ServicesPage() {
   const [services, setServices] = useState<Service[]>([])
@@ -21,6 +49,7 @@ export default function ServicesPage() {
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
   const [oneTimeCredential, setOneTimeCredential] = useState<{ serviceId: string; secret: string; pending: boolean } | null>(null)
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copying' | 'copied' | 'error'>('idle')
   const [rotating, setRotating] = useState<string | null>(null)
   const [credentialAction, setCredentialAction] = useState<{
     open: boolean
@@ -48,6 +77,16 @@ export default function ServicesPage() {
   useEffect(() => {
     fetchServices()
   }, [])
+
+  useEffect(() => {
+    setCopyStatus('idle')
+  }, [oneTimeCredential?.secret])
+
+  useEffect(() => {
+    if (copyStatus !== 'copied' && copyStatus !== 'error') return
+    const timeout = window.setTimeout(() => setCopyStatus('idle'), 2400)
+    return () => window.clearTimeout(timeout)
+  }, [copyStatus])
 
   const openCreateForm = () => {
     setEditingSvc(null)
@@ -164,6 +203,17 @@ export default function ServicesPage() {
     }
   }
 
+  const handleCopyCredential = async () => {
+    if (!oneTimeCredential || copyStatus === 'copying') return
+    setCopyStatus('copying')
+    try {
+      await copyText(oneTimeCredential.secret)
+      setCopyStatus('copied')
+    } catch {
+      setCopyStatus('error')
+    }
+  }
+
   return (
     <>
       {/* Delete confirmation dialog */}
@@ -210,11 +260,23 @@ export default function ServicesPage() {
               <Button
                 type="button"
                 variant="outline"
-                size="icon"
-                aria-label="复制 Webhook 凭证"
-                onClick={() => oneTimeCredential && navigator.clipboard.writeText(oneTimeCredential.secret)}
+                size="sm"
+                className={cn(
+                  'min-w-20',
+                  copyStatus === 'copied' && 'border-emerald-500/50 text-emerald-700',
+                  copyStatus === 'error' && 'border-destructive/50 text-destructive',
+                )}
+                aria-label={copyStatus === 'copied' ? '已复制 Webhook 凭证' : copyStatus === 'error' ? '复制 Webhook 凭证失败' : '复制 Webhook 凭证'}
+                onClick={handleCopyCredential}
+                disabled={copyStatus === 'copying'}
               >
-                <Copy className="h-4 w-4" />
+                {copyStatus === 'copied' ? (
+                  <><Check className="h-4 w-4" />已复制</>
+                ) : copyStatus === 'error' ? (
+                  <><CircleAlert className="h-4 w-4" />复制失败</>
+                ) : (
+                  <><Copy className="h-4 w-4" />{copyStatus === 'copying' ? '复制中' : '复制'}</>
+                )}
               </Button>
             </div>
           </div>
