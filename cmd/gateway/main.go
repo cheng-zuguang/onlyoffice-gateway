@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,18 +17,11 @@ import (
 	"github.com/zenmind/onlyoffice-gateway/internal/audit"
 	"github.com/zenmind/onlyoffice-gateway/internal/config"
 	"github.com/zenmind/onlyoffice-gateway/internal/gateway"
-	"github.com/zenmind/onlyoffice-gateway/internal/version"
 )
 
 func main() {
 	configPath := flag.String("config", "", "optional path to gateway.yaml")
-	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("onlyoffice-gateway %s (built %s, commit %s)\n", version.Version, version.BuildTime, version.Commit)
-		os.Exit(0)
-	}
 
 	loadDotEnv(".env")
 
@@ -66,7 +58,7 @@ func main() {
 
 	handler, closeGateway := newRootRuntime(cfg, serviceStore, adminUser, adminPass)
 
-	log.Printf("Gateway %s listening on %s", version.Version, cfg.ListenAddr)
+	log.Printf("Gateway listening on %s", cfg.ListenAddr)
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,

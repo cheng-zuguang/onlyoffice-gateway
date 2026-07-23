@@ -1,15 +1,7 @@
-VERSION := $(shell cat VERSION 2>/dev/null || echo "dev")
-BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-LDFLAGS := -ldflags "-X github.com/zenmind/onlyoffice-gateway/internal/version.Version=$(VERSION) -X github.com/zenmind/onlyoffice-gateway/internal/version.BuildTime=$(BUILD_TIME) -X github.com/zenmind/onlyoffice-gateway/internal/version.Commit=$(COMMIT)"
-
-.PHONY: build test run clean version frontend-build frontend-dev dev init-secrets test-init-secrets
-
-version:
-	@echo $(VERSION)
+.PHONY: build test run clean frontend-build frontend-dev dev init-secrets test-init-secrets
 
 build:
-	go build $(LDFLAGS) -o bin/gateway ./cmd/gateway
+	go build -o bin/gateway ./cmd/gateway
 
 test:
 	go test ./... -count=1 -timeout 120s
@@ -26,7 +18,7 @@ run:
 		cp .env.example .env; \
 		echo "  → Run 'make init-secrets', then set ADMIN_PASSWORD."; \
 	fi
-	go run -ldflags "-X github.com/zenmind/onlyoffice-gateway/internal/version.Version=$(VERSION)" ./cmd/gateway
+	go run ./cmd/gateway
 
 clean:
 	rm -rf bin/ data/
